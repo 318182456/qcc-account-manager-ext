@@ -107,17 +107,17 @@ addCurrentBtn.addEventListener("click", async () => {
                 hasCoreCookie = true;
             }
         }
-        
+
         // 如果没有找到带 expirationDate 的核心 Cookie (可能是 Session 级别或被隐藏)
         // 给定一个保守的 15 天默认过期时间，避免取到统计 Cookie 的1-2年误导值
         if (!hasCoreCookie || maxExpiry === 0) {
             maxExpiry = (Date.now() / 1000) + 15 * 24 * 3600;
         }
         const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
-        
+
         let accountId;
         const existingAccIndex = storage.accounts.findIndex(a => a.id === storage.currentAccountId);
-        
+
         if (storage.currentAccountId && existingAccIndex !== -1) {
             // 更新现有账号
             accountId = storage.currentAccountId;
@@ -149,7 +149,7 @@ addCurrentBtn.addEventListener("click", async () => {
 
         // 如果是更新，保留输入框，否则清空
         if (!storage.currentAccountId) accNameInput.value = "";
-        
+
         alert("保存/更新成功！");
         renderAccounts();
     } catch (e) {
@@ -172,9 +172,37 @@ async function renderAccounts() {
         if (currAcc) {
             currentAccountText.textContent = currAcc.name;
             if (saveBox) {
-                saveBox.style.display = "flex";
-                accNameInput.value = currAcc.name;
-                addCurrentBtn.textContent = "更新这笔账号的会话";
+                // 探测当前实时的 Cookie 状态
+                const liveCookies = await chrome.cookies.getAll({ domain: "qcc.com" });
+                let liveMax = 0;
+                let hasCore = false;
+                for (let c of liveCookies) {
+                    if (["QCCSESSID", "qcc_did", "Token", "acw_tc"].includes(c.name)) {
+                        if (c.expirationDate && c.expirationDate > liveMax) liveMax = c.expirationDate;
+                        hasCore = true;
+                    }
+                }
+                const nowSec = Date.now() / 1000;
+                
+                // 数据库记录中是否已过期
+                const dbExpired = nowSec > currAcc.expiry || (currAcc.lastStatus && currAcc.lastStatus.includes("失效"));
+                // 浏览器当前是否已经拿到了新的有效票据 (如果 expirationDate 比现在多 2 天以上，或者没设过期日即 Session)
+                const liveValid = hasCore && (liveMax === 0 || liveMax > nowSec + 86400);
+
+                if (dbExpired) {
+                    saveBox.style.display = "flex";
+                    accNameInput.value = currAcc.name;
+                    if (!liveValid) {
+                        addCurrentBtn.textContent = "请先在网页登录后再更新";
+                        addCurrentBtn.disabled = true;
+                    } else {
+                        addCurrentBtn.textContent = "更新这个账号";
+                        addCurrentBtn.disabled = false;
+                    }
+                } else {
+                    // 如果账号正常在线并未过期，就不需要显示更新框（恢复原有的干净界面）
+                    saveBox.style.display = "none";
+                }
             }
         } else {
             currentAccountText.textContent = "未知 / 未保存";
@@ -482,8 +510,11 @@ async function checkAccountStatus() {
 
     const tab = await getActiveQccTab();
     if (!tab) {
-        accountStatusText.textContent = "请打开页面体验 DOM 检测";
-        accountStatusText.style.color = "var(--text-secondary)";
+        accountStatusText.innerHTML = '<a href="#" id="jumpToQcc" style="color:var(--text-secondary); text-decoration:underline;">请打开页面体验 DOM 检测 (点击前往)</a>';
+        document.getElementById("jumpToQcc").addEventListener("click", (e) => {
+            e.preventDefault();
+            chrome.tabs.create({ url: QCC_URL });
+        });
         return;
     }
 
