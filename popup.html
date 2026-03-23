@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>企查查账号管理</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h2>企查查多账号管理</h2>
+        </header>
+
+        <div class="actions-card">
+            <div class="status-indicator">
+                当前使用: <span id="currentAccountText" style="font-weight: bold; color: var(--primary-color);">未知 / 未保存</span><br>
+                当前状态: <span id="accountStatusText" style="font-weight: bold;">检测中...</span>
+            </div>
+            <div id="saveBox" style="display: flex; flex-direction: column; gap: 8px;">
+                <input type="text" id="accNameInput" placeholder="输入当前账号备注 (如: 手机号)" />
+                <button id="addCurrentBtn" class="primary-btn">保存当前账号信息</button>
+            </div>
+            <button id="clearAndAddNewBtn" class="secondary-btn danger-text">添加新账号</button>
+        </div>
+
+        <div class="list-section">
+            <div class="list-header">
+                <h3>已保存的账号</h3>
+                <button id="checkAllBtn" class="secondary-btn check-all-btn">一键测活</button>
+            </div>
+            <div id="accountList" class="account-list">
+                <!-- 动态生成账号列表 -->
+            </div>
+            <div id="emptyState" class="empty-state" style="display: none;">
+                暂无保存的账号
+            </div>
+        </div>
+
+        <div class="footer-actions">
+            <button id="downloadSyncBtn" class="primary-btn" style="background-color: #0f9d58;">⬇️ 从云端同步</button>
+            <button id="uploadSyncBtn" class="primary-btn" style="background-color: #f4b400;">⬆️ 备份到云端</button>
+            <button id="openOptionsBtn" class="secondary-btn" style="flex: 0; white-space: nowrap; padding: 8px;">⚙️配置</button>
+        </div>
+
+    </div>
+
+    <script src="popup.js"></script>
+</body>
+
+</html>

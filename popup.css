@@ -1,0 +1,256 @@
+:root {
+  --primary-color: #1a73e8;
+  --primary-hover: #1557b0;
+  --danger-color: #d93025;
+  --danger-hover: #a50e0e;
+  --bg-color: #f8f9fa;
+  --card-bg: #ffffff;
+  --text-primary: #202124;
+  --text-secondary: #5f6368;
+  --border-color: #dadce0;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background-color: var(--bg-color);
+  color: var(--text-primary);
+  width: 360px;
+  height: 580px;
+  overflow: hidden;
+}
+
+.container {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: 100%;
+  box-sizing: border-box;
+}
+
+header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--primary-color);
+  text-align: center;
+}
+
+.actions-card,
+.list-section,
+.import-panel {
+  background: var(--card-bg);
+  border-radius: 8px;
+  padding: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  border: 1px solid var(--border-color);
+}
+
+.list-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  min-height: 200px;
+}
+
+.actions-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+input[type="text"],
+textarea {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-size: 14px;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+input[type="text"]:focus,
+textarea:focus {
+  outline: 2px solid var(--primary-color);
+  border-color: transparent;
+}
+
+button {
+  cursor: pointer;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+.primary-btn {
+  background-color: var(--primary-color);
+  color: white;
+  width: 100%;
+}
+
+.primary-btn:hover {
+  background-color: var(--primary-hover);
+}
+
+.secondary-btn {
+  background-color: transparent;
+  color: var(--primary-color);
+  border: 1px solid var(--primary-color);
+}
+
+.secondary-btn:hover {
+  background-color: #f1f3f4;
+}
+
+.danger-btn {
+  background-color: var(--danger-color);
+  color: white;
+}
+
+.danger-btn:hover {
+  background-color: var(--danger-hover);
+}
+
+.list-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 6px;
+  margin-bottom: 12px;
+}
+
+.list-header h3 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-secondary);
+}
+
+.check-all-btn {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.account-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.account-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.account-list::-webkit-scrollbar-thumb {
+  background-color: #ccc;
+  border-radius: 3px;
+}
+
+.account-list::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+.account-item {
+  display: flex;
+  flex-direction: column;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background-color: #fafafa;
+  transition: transform 0.1s;
+}
+
+.account-item:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  /* 移除 translateY 避免小数像素计算引起的晃动 */
+  background-color: #f1f3f5;
+}
+
+.account-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.account-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.account-expiry {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.account-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.account-actions button {
+  flex: 1;
+  padding: 6px;
+  font-size: 13px;
+}
+
+.empty-state {
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+  padding: 16px 0;
+}
+
+.footer-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.footer-actions button {
+  flex: 1;
+}
+
+.import-panel {
+  flex-shrink: 0;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.panel-actions button {
+  flex: 1;
+}
+
+.status-indicator {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--border-color);
+}
+
+.danger-text {
+  color: var(--danger-color);
+  border-color: var(--danger-color);
+  margin-top: 4px;
+}
+
+.danger-text:hover {
+  background-color: #fce8e6;
+}
