@@ -2,13 +2,14 @@
   "manifest_version": 3,
   "name": "企查查多账号管理",
   "version": "1.0.0",
-  "description": "管理企查查 (qcc.com) 本地账号会话，支持一键切换、备份导入与自动续期。",
+  "description": "管理企查查 (qcc.com) 本地多账号会话，支持一键切换、自动保活续期以及 WebDAV 多设备云同步。",
   "permissions": [
     "cookies",
     "storage",
     "scripting",
     "alarms",
-    "activeTab"
+    "activeTab",
+    "notifications"
   ],
   "host_permissions": [
     "*://*.qcc.com/*",

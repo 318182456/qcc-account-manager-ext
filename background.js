@@ -43,6 +43,27 @@ async function performRenewalFetch() {
             }
         });
         console.log("保活请求成功, Status:", response.status);
+
+        // 新增：检查列表中除当前账号外的其他账号，如果有剩余时间不到 30 天的，则触发通知提醒切换保活
+        const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
+        const nowSec = Math.floor(Date.now() / 1000);
+
+        const expiringAccounts = storage.accounts.filter(a => {
+            if (a.deleted || a.id === storage.currentAccountId || !a.expiry) return false;
+            const daysLeft = (a.expiry - nowSec) / (24 * 3600);
+            return daysLeft < 30;
+        });
+
+        if (expiringAccounts.length > 0) {
+            const names = expiringAccounts.map(a => a.name).join('、');
+            chrome.notifications.create(`qcc-renewal-others-${Date.now()}`, {
+                type: "basic",
+                iconUrl: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48Y2lyY2xlIGN4PSI1MCIgY3k9IjUwIiByPSI1MCIgZmlsbD0iI2Y0NDMzNiIvPjx0ZXh0IHg9IjUwIiB5PSI1NCIgZm9udC1zaXplPSI2MCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iI2ZmZiIgZHk9Ii4zZW0iPiE8L3RleHQ+PC9zdmc+",
+                title: "企查查账号保活提醒",
+                message: `有 ${expiringAccounts.length} 个账号（${names}）的Cookie有效期已不足30天，请尽快切换至这些账号以进行保活续期。`,
+                priority: 2
+            });
+        }
     } catch (e) {
         console.error("保活请求失败:", e);
     }
