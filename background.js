@@ -231,7 +231,18 @@ async function performAllAccountsRenewal() {
         return;
     }
 
-    console.log("当前无企查查活动页面，开始后台静默轮询保活所有备用账号...");
+    console.log("当前无企查查活动页面，准备后台静默轮询保活所有备用账号...");
+    
+    // 在开始长达几分钟的保活前，强制从 WebDAV 拉取一次最新快照！
+    // 防止这台电脑一整天没开机/还没轮到自动同步，脑子里装的还是旧数据
+    // 从而导致它强行去保活一个已经被别的设备删除的账号，进而由于更新了时间戳导致“诈尸”覆盖云端
+    try {
+        await performAutoSync();
+        console.log("启动保活前，先机云端同步完成。");
+    } catch (e) {
+        console.warn("启动保活前云端同步失败，将继续执行:", e);
+    }
+
     const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
     const targets = storage.accounts.filter(a => !a.deleted);
 
@@ -272,10 +283,13 @@ async function performAllAccountsRenewal() {
                 isAlive = false;
             }
 
-            const dbAcc = storage.accounts.find(a => a.id === acc.id);
-            if (dbAcc) {
+            // 安全更新：重新从存储中读取最新状态，防止在我们执行漫长网络请求/等待时，其它端同步了删除指令
+            const freshStorage = await chrome.storage.local.get({ accounts: [] });
+            const freshDbAcc = freshStorage.accounts.find(a => a.id === acc.id);
+            
+            if (freshDbAcc && !freshDbAcc.deleted) {
                 if (isAlive) {
-                    dbAcc.lastStatus = "正常在线 (后台更新)";
+                    freshDbAcc.lastStatus = "正常在线 (后台更新)";
 
                     // 成功保活后，更新最新的 Cookie 和过期时间
                     const newCookies = await chrome.cookies.getAll({ domain: "qcc.com" });
@@ -289,13 +303,13 @@ async function performAllAccountsRenewal() {
                     }
                     if (!hasCore || maxExpiry === 0) maxExpiry = (Date.now() / 1000) + 15 * 24 * 3600;
 
-                    dbAcc.cookies = newCookies.map(c => ({
+                    freshDbAcc.cookies = newCookies.map(c => ({
                         name: c.name, value: c.value, domain: c.domain,
                         path: c.path, secure: c.secure, sameSite: c.sameSite,
                         expirationDate: c.expirationDate
                     }));
-                    dbAcc.expiry = maxExpiry;
-                    dbAcc.savedAt = Date.now(); // 触发 WebDAV 增量同步
+                    freshDbAcc.expiry = maxExpiry;
+                    freshDbAcc.savedAt = Date.now(); // 触发 WebDAV 增量同步
 
                     // 如果轮换的是当前正在使用的账号，更新用于最后还原的备份 Cookie
                     if (acc.id === storage.currentAccountId) {
@@ -303,11 +317,11 @@ async function performAllAccountsRenewal() {
                         currentCookies.push(...newCookies);
                     }
                 } else {
-                    dbAcc.lastStatus = `失效 (${res.status})`;
-                    dbAcc.expiry = Math.floor(Date.now() / 1000) - 1;
+                    freshDbAcc.lastStatus = `失效 (${res.status})`;
+                    freshDbAcc.expiry = Math.floor(Date.now() / 1000) - 1;
                 }
+                await chrome.storage.local.set({ accounts: freshStorage.accounts });
             }
-            await chrome.storage.local.set({ accounts: storage.accounts });
         } catch (e) {
             console.warn(`静默保活账号 ${acc.name} 失败`, e);
         }
