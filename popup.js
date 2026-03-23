@@ -96,35 +96,67 @@ addCurrentBtn.addEventListener("click", async () => {
         // 读取 LocalStorage
         const lsData = await getQccLocalStorage(tab.id);
 
-        // 获取最大有效期作为账号大致过期时间
+        // 获取核心登录凭证的有效期作为账号的真正过期时间
         let maxExpiry = 0;
+        let hasCoreCookie = false;
         for (let c of cookies) {
-            if (c.expirationDate && c.expirationDate > maxExpiry) {
-                maxExpiry = c.expirationDate;
+            if (["QCCSESSID", "qcc_did", "Token", "acw_tc"].includes(c.name)) {
+                if (c.expirationDate && c.expirationDate > maxExpiry) {
+                    maxExpiry = c.expirationDate;
+                }
+                hasCoreCookie = true;
             }
         }
+        
+        // 如果没有找到带 expirationDate 的核心 Cookie (可能是 Session 级别或被隐藏)
+        // 给定一个保守的 15 天默认过期时间，避免取到统计 Cookie 的1-2年误导值
+        if (!hasCoreCookie || maxExpiry === 0) {
+            maxExpiry = (Date.now() / 1000) + 15 * 24 * 3600;
+        }
+        const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
+        
+        let accountId;
+        const existingAccIndex = storage.accounts.findIndex(a => a.id === storage.currentAccountId);
+        
+        if (storage.currentAccountId && existingAccIndex !== -1) {
+            // 更新现有账号
+            accountId = storage.currentAccountId;
+            storage.accounts[existingAccIndex] = {
+                ...storage.accounts[existingAccIndex],
+                name,
+                cookies,
+                localStorage: lsData,
+                expiry: maxExpiry,
+                savedAt: Date.now(),
+                lastStatus: "正常在线 (重新登录)",
+                deleted: false
+            };
+        } else {
+            // 新增全新账号
+            accountId = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString() + Math.random().toString().substring(2, 6));
+            const accountData = {
+                id: accountId,
+                name,
+                cookies,
+                localStorage: lsData,
+                expiry: maxExpiry,
+                savedAt: Date.now()
+            };
+            storage.accounts.push(accountData);
+        }
 
-        const accountData = {
-            id: crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString() + Math.random().toString().substring(2, 6)),
-            name,
-            cookies,
-            localStorage: lsData,
-            expiry: maxExpiry || (Date.now() / 1000 + 86400 * 30),
-            savedAt: Date.now()
-        };
+        await chrome.storage.local.set({ accounts: storage.accounts, currentAccountId: accountId });
 
-        const storage = await chrome.storage.local.get({ accounts: [] });
-        storage.accounts.push(accountData);
-        await chrome.storage.local.set({ accounts: storage.accounts, currentAccountId: accountData.id });
-
-        accNameInput.value = "";
-        alert("保存成功！");
+        // 如果是更新，保留输入框，否则清空
+        if (!storage.currentAccountId) accNameInput.value = "";
+        
+        alert("保存/更新成功！");
         renderAccounts();
     } catch (e) {
         console.error(e);
-        alert("保存失败: " + e.message);
+        alert("操作失败: " + e.message);
     } finally {
-        addCurrentBtn.textContent = "保存当前账号信息";
+        addCurrentBtn.textContent = "保存/更新账号信息";
         addCurrentBtn.disabled = false;
     }
 });
@@ -139,14 +171,26 @@ async function renderAccounts() {
         const currAcc = storage.accounts.find(a => a.id === storage.currentAccountId);
         if (currAcc) {
             currentAccountText.textContent = currAcc.name;
-            if (saveBox) saveBox.style.display = "none";
+            if (saveBox) {
+                saveBox.style.display = "flex";
+                accNameInput.value = currAcc.name;
+                addCurrentBtn.textContent = "更新这笔账号的会话";
+            }
         } else {
             currentAccountText.textContent = "未知 / 未保存";
-            if (saveBox) saveBox.style.display = "flex";
+            if (saveBox) {
+                saveBox.style.display = "flex";
+                accNameInput.value = "";
+                addCurrentBtn.textContent = "保存为新账号";
+            }
         }
     } else {
         currentAccountText.textContent = "未知 / 未保存";
-        if (saveBox) saveBox.style.display = "flex";
+        if (saveBox) {
+            saveBox.style.display = "flex";
+            accNameInput.value = "";
+            addCurrentBtn.textContent = "保存为新账号";
+        }
     }
 
     if (storage.accounts.length === 0) {
@@ -162,7 +206,7 @@ async function renderAccounts() {
         const isExpired = (Date.now() / 1000) > acc.expiry;
         const expiryColor = isExpired ? "var(--danger-color)" : "var(--text-secondary)";
         const d = new Date(acc.expiry * 1000);
-        const expiryHTML = isExpired ? "已过期" : `过期: ${d.toLocaleDateString()} ${d.toLocaleTimeString("zh-CN", { hour12: false })}`;
+        const expiryHTML = isExpired ? "⚠️ 已过期 (需重新登录)" : `过期: ${d.toLocaleDateString()} ${d.toLocaleTimeString("zh-CN", { hour12: false })}`;
         const isCurrent = acc.id === storage.currentAccountId;
 
         const lastStatusText = acc.lastStatus || (isCurrent ? accountStatusText.textContent : "未检测");
@@ -180,7 +224,7 @@ async function renderAccounts() {
                 </div>
             </div>
             <div class="account-actions">
-                <button class="primary-btn switch-btn" data-id="${acc.id}" ${isCurrent ? 'disabled style="background:#80868b;border-color:#80868b;cursor:not-allowed;"' : ''}>${isCurrent ? '正在使用' : '切换'}</button>
+                <button class="primary-btn switch-btn" data-id="${acc.id}" ${isCurrent ? 'disabled style="background:#80868b;border-color:#80868b;cursor:not-allowed;"' : ''}>${isCurrent ? '正在使用' : (isExpired ? '重新登录' : '切换')}</button>
                 <button class="secondary-btn check-btn" data-id="${acc.id}">检测连通</button>
                 <button class="danger-btn delete-btn" data-id="${acc.id}">删除</button>
             </div>

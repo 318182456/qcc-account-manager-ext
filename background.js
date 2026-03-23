@@ -4,8 +4,9 @@ const QCC_INDEX_URL = "https://www.qcc.com/";
 
 // 初始化
 chrome.runtime.onInstalled.addListener(() => {
-    chrome.alarms.create(RENEWAL_ALARM_NAME, { periodInMinutes: 120 });
+    chrome.alarms.create(RENEWAL_ALARM_NAME, { periodInMinutes: 60 }); // 缩短保活频率为60分钟
     chrome.alarms.create(SYNC_ALARM_NAME, { periodInMinutes: 30 });
+    chrome.alarms.create("qcc-all-session-renewal", { periodInMinutes: 240 }); // 全员保活，每4小时触发一次
 });
 
 // 监听 Popup 发来的重置续期请求消息
@@ -23,6 +24,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     } else if (alarm.name === SYNC_ALARM_NAME) {
         console.log("执行定期 WebDAV 同步扫描...");
         performAutoSync();
+    } else if (alarm.name === "qcc-all-session-renewal") {
+        console.log("触发全员静默保活...");
+        performAllAccountsRenewal();
     }
 });
 
@@ -32,35 +36,59 @@ chrome.alarms.onAlarm.addListener((alarm) => {
  */
 async function performRenewalFetch() {
     try {
-        // 由于 fetch qcc.com 只用到当前浏览器状态下处于激活状态的 qcc cookies
-        // 如果想针对每一个保存的账号做到保活，过程极其复杂(需要循环切换cookie做fetch再切回来)
-        // 且频繁更换全局Cookie会导致用户正在使用的会话被覆盖。
-        // 因此目前的机制是：仅保活浏览器【当前正在使用】的这个 qcc.com 会话。
         const response = await fetch(QCC_INDEX_URL, {
-            method: "HEAD",
+            method: "GET", // 改为 GET 避免被拦截
             headers: {
-                "User-Agent": navigator.userAgent
+                "User-Agent": navigator.userAgent,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
             }
         });
-        console.log("保活请求成功, Status:", response.status);
 
-        // 新增：检查列表中除当前账号外的其他账号，如果有剩余时间不到 30 天的，则触发通知提醒切换保活
+        // 判定本次保活是否因 Session 失效被重定向到 /login 或者直接报错
+        let isAlive = true;
+        if (response.status === 401 || response.status === 403 || response.status === 425) {
+            isAlive = false;
+        } else if (response.url && response.url.includes("login")) {
+            isAlive = false;
+        }
+
         const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
+
+        if (!isAlive && storage.currentAccountId) {
+            console.warn("当前账号保活发现已掉线！");
+            const currIdx = storage.accounts.findIndex(a => a.id === storage.currentAccountId);
+            if (currIdx !== -1) {
+                storage.accounts[currIdx].lastStatus = `失效 (${response.status})`;
+                storage.accounts[currIdx].expiry = Math.floor(Date.now() / 1000) - 1; // 强制置为过期
+                await chrome.storage.local.set({ accounts: storage.accounts });
+
+                chrome.notifications.create(`qcc-dead-${Date.now()}`, {
+                    type: "basic",
+                    iconUrl: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48Y2lyY2xlIGN4PSI1MCIgY3k9IjUwIiByPSI1MCIgZmlsbD0iI2Y0NDMzNiIvPjx0ZXh0IHg9IjUwIiB5PSI1NCIgZm9udC1zaXplPSI2MCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iI2ZmZiIgZHk9Ii4zZW0iPiE8L3RleHQ+PC9zdmc+",
+                    title: "企查查当前账号已失效",
+                    message: `您当前使用的账号【${storage.accounts[currIdx].name}】已被服务器强制登出或掉线，请及时重新登录！`,
+                    priority: 2
+                });
+            }
+        } else {
+            console.log("当前账号保活请求成功, Status:", response.status);
+        }
+
         const nowSec = Math.floor(Date.now() / 1000);
 
         const expiringAccounts = storage.accounts.filter(a => {
             if (a.deleted || a.id === storage.currentAccountId || !a.expiry) return false;
             const daysLeft = (a.expiry - nowSec) / (24 * 3600);
-            return daysLeft < 30;
+            return daysLeft > 0 && daysLeft < 3;
         });
-
+        
         if (expiringAccounts.length > 0) {
             const names = expiringAccounts.map(a => a.name).join('、');
             chrome.notifications.create(`qcc-renewal-others-${Date.now()}`, {
                 type: "basic",
                 iconUrl: "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48Y2lyY2xlIGN4PSI1MCIgY3k9IjUwIiByPSI1MCIgZmlsbD0iI2Y0NDMzNiIvPjx0ZXh0IHg9IjUwIiB5PSI1NCIgZm9udC1zaXplPSI2MCIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZmlsbD0iI2ZmZiIgZHk9Ii4zZW0iPiE8L3RleHQ+PC9zdmc+",
                 title: "企查查账号保活提醒",
-                message: `有 ${expiringAccounts.length} 个账号（${names}）的Cookie有效期已不足30天，请尽快切换至这些账号以进行保活续期。`,
+                message: `有 ${expiringAccounts.length} 个账号（${names}）的Cookie有效期已濒临失效（不足 3 天），请尽快点击扩展页面的“重新登录”或进行切换保活。`,
                 priority: 2
             });
         }
@@ -162,4 +190,99 @@ async function performAutoSync() {
     }
 }
 
+// 全员静默轮换保活机制
+async function performAllAccountsRenewal() {
+    // 检查是否有打开的企查查网页，如果没有才进行后台轮换，防干扰
+    const tabs = await chrome.tabs.query({ url: "*://*.qcc.com/*" });
+    if (tabs && tabs.length > 0) {
+        console.log("检测到当前有打开的企查查页面，跳过全员保活，防止干扰用户...");
+        return;
+    }
+        
+    console.log("当前无企查查活动页面，开始后台静默轮询保活所有备用账号...");
+    const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
+        const targets = storage.accounts.filter(a => !a.deleted && a.id !== storage.currentAccountId);
 
+        if (targets.length === 0) return;
+
+        // 备份当前全局 Cookie
+        const currentCookies = await chrome.cookies.getAll({ domain: "qcc.com" });
+
+        for (let i = 0; i < targets.length; i++) {
+            const acc = targets[i];
+
+            // 清理并注入目标账号的 Cookie
+            await clearAllQccDbCookies();
+            const setPromises = acc.cookies.map(c => {
+                const domain = c.domain.startsWith(".") ? c.domain.substring(1) : c.domain;
+                const pfx = c.secure ? "https://" : "http://";
+                return chrome.cookies.set({
+                    url: pfx + domain + c.path,
+                    name: c.name, value: c.value, domain: c.domain, path: c.path,
+                    secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite,
+                    expirationDate: c.expirationDate, storeId: c.storeId
+                }).catch(() => { });
+            });
+            await Promise.all(setPromises);
+
+            // 发起 GET 请求
+            try {
+                const res = await fetch("https://www.qcc.com/", {
+                    method: "GET",
+                    headers: {
+                        "User-Agent": navigator.userAgent,
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+                    }
+                });
+
+                let isAlive = true;
+                if (res.status === 401 || res.status === 403 || res.status === 425 || (res.url && res.url.includes("login"))) {
+                    isAlive = false;
+                }
+
+                const dbAcc = storage.accounts.find(a => a.id === acc.id);
+                if (dbAcc) {
+                    if (isAlive) {
+                        dbAcc.lastStatus = "正常在线 (后台更新)";
+                    } else {
+                        dbAcc.lastStatus = `失效 (${res.status})`;
+                        dbAcc.expiry = Math.floor(Date.now() / 1000) - 1;
+                    }
+                }
+                await chrome.storage.local.set({ accounts: storage.accounts });
+            } catch (e) {
+                console.warn(`静默保活账号 ${acc.name} 失败`, e);
+            }
+
+            // 每个账号间隔 8 秒，避免并发风控，同时控制总耗时在 Service Worker 存活期内
+            if (i < targets.length - 1) {
+                await new Promise(resolve => setTimeout(resolve, 8000));
+            }
+        }
+
+        // 还原最初的 Cookie
+        await clearAllQccDbCookies();
+        const restorePromises = currentCookies.map(c => {
+            const domain = c.domain.startsWith(".") ? c.domain.substring(1) : c.domain;
+            const pfx = c.secure ? "https://" : "http://";
+            return chrome.cookies.set({
+                url: pfx + domain + c.path,
+                name: c.name, value: c.value, domain: c.domain, path: c.path,
+                secure: c.secure, httpOnly: c.httpOnly, sameSite: c.sameSite,
+                expirationDate: c.expirationDate, storeId: c.storeId
+            }).catch(() => { });
+        });
+        await Promise.all(restorePromises);
+        console.log("全员静默保活完成，已还原原先全局现场。");
+}
+
+// 清除所有的 QCC Cookies 辅助函数
+async function clearAllQccDbCookies() {
+    const cookies = await chrome.cookies.getAll({ domain: "qcc.com" });
+    const promises = cookies.map(c => {
+        const pfx = c.secure ? "https://" : "http://";
+        const domain = c.domain.startsWith(".") ? c.domain.substring(1) : c.domain;
+        return chrome.cookies.remove({ url: pfx + domain + c.path, name: c.name });
+    });
+    await Promise.all(promises);
+}
