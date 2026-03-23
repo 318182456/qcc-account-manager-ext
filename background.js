@@ -70,8 +70,35 @@ async function performRenewalFetch() {
                     priority: 2
                 });
             }
-        } else {
             console.log("当前账号保活请求成功, Status:", response.status);
+            
+            // 成功保活后，抓取最新的 Cookie 并更新以同步过期时间
+            if (storage.currentAccountId) {
+                const currIdx = storage.accounts.findIndex(a => a.id === storage.currentAccountId);
+                if (currIdx !== -1) {
+                    const newCookies = await chrome.cookies.getAll({ domain: "qcc.com" });
+                    
+                    let maxExpiry = 0;
+                    let hasCore = false;
+                    for (let c of newCookies) {
+                        if (["QCCSESSID", "qcc_did", "Token", "acw_tc"].includes(c.name)) {
+                            if (c.expirationDate && c.expirationDate > maxExpiry) maxExpiry = c.expirationDate;
+                            hasCore = true;
+                        }
+                    }
+                    if (!hasCore || maxExpiry === 0) maxExpiry = (Date.now() / 1000) + 15 * 24 * 3600;
+                    
+                    storage.accounts[currIdx].cookies = newCookies.map(c => ({
+                        name: c.name, value: c.value, domain: c.domain,
+                        path: c.path, secure: c.secure, sameSite: c.sameSite,
+                        expirationDate: c.expirationDate
+                    }));
+                    storage.accounts[currIdx].expiry = maxExpiry;
+                    storage.accounts[currIdx].savedAt = Date.now(); // 触发 WebDAV 同步
+                    storage.accounts[currIdx].lastStatus = "正常在线 (已续期)";
+                    await chrome.storage.local.set({ accounts: storage.accounts });
+                }
+            }
         }
 
         const nowSec = Math.floor(Date.now() / 1000);
@@ -244,6 +271,26 @@ async function performAllAccountsRenewal() {
                 if (dbAcc) {
                     if (isAlive) {
                         dbAcc.lastStatus = "正常在线 (后台更新)";
+                        
+                        // 成功保活后，更新最新的 Cookie 和过期时间
+                        const newCookies = await chrome.cookies.getAll({ domain: "qcc.com" });
+                        let maxExpiry = 0;
+                        let hasCore = false;
+                        for (let c of newCookies) {
+                            if (["QCCSESSID", "qcc_did", "Token", "acw_tc"].includes(c.name)) {
+                                if (c.expirationDate && c.expirationDate > maxExpiry) maxExpiry = c.expirationDate;
+                                hasCore = true;
+                            }
+                        }
+                        if (!hasCore || maxExpiry === 0) maxExpiry = (Date.now() / 1000) + 15 * 24 * 3600;
+                        
+                        dbAcc.cookies = newCookies.map(c => ({
+                            name: c.name, value: c.value, domain: c.domain,
+                            path: c.path, secure: c.secure, sameSite: c.sameSite,
+                            expirationDate: c.expirationDate
+                        }));
+                        dbAcc.expiry = maxExpiry;
+                        dbAcc.savedAt = Date.now(); // 触发 WebDAV 增量同步
                     } else {
                         dbAcc.lastStatus = `失效 (${res.status})`;
                         dbAcc.expiry = Math.floor(Date.now() / 1000) - 1;
