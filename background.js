@@ -181,7 +181,7 @@ async function performAutoSync() {
             if (localTime > wasUploaded && localTime > remoteTime) {
                 const slim = { ...acc, cookies: (acc.cookies || []).map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, secure: c.secure, sameSite: c.sameSite, expirationDate: c.expirationDate })) };
                 delete slim.localStorage; // 核心修复：剔除体积庞大的 localStorage 缓存，只同步核心账号信息和 Cookie
-                
+
                 const h2 = { ...headers, "Content-Type": "application/json" };
                 await abortFetch(baseUrl + acc.id + ".json", "PUT", h2, JSON.stringify(slim));
                 newLastUpload[acc.id] = localTime;
@@ -233,7 +233,7 @@ async function performAllAccountsRenewal() {
 
     console.log("当前无企查查活动页面，开始后台静默轮询保活所有备用账号...");
     const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
-    const targets = storage.accounts.filter(a => !a.deleted && a.id !== storage.currentAccountId);
+    const targets = storage.accounts.filter(a => !a.deleted);
 
     if (targets.length === 0) return;
 
@@ -296,6 +296,12 @@ async function performAllAccountsRenewal() {
                     }));
                     dbAcc.expiry = maxExpiry;
                     dbAcc.savedAt = Date.now(); // 触发 WebDAV 增量同步
+
+                    // 如果轮换的是当前正在使用的账号，更新用于最后还原的备份 Cookie
+                    if (acc.id === storage.currentAccountId) {
+                        currentCookies.length = 0;
+                        currentCookies.push(...newCookies);
+                    }
                 } else {
                     dbAcc.lastStatus = `失效 (${res.status})`;
                     dbAcc.expiry = Math.floor(Date.now() / 1000) - 1;
