@@ -47,6 +47,7 @@ async function getQccLocalStorage(tabId) {
 
 // 向页面注入目标 LocalStorage
 async function setQccLocalStorage(tabId, lsData) {
+    const safeData = lsData || {};
     await chrome.scripting.executeScript({
         target: { tabId },
         func: (dataStr) => {
@@ -56,7 +57,7 @@ async function setQccLocalStorage(tabId, lsData) {
                 window.localStorage.setItem(key, data[key]);
             }
         },
-        args: [JSON.stringify(lsData)]
+        args: [JSON.stringify(safeData)]
     });
 }
 
