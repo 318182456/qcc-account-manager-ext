@@ -36,7 +36,17 @@ async function getQccLocalStorage(tabId) {
     try {
         const results = await chrome.scripting.executeScript({
             target: { tabId },
-            func: () => JSON.stringify(window.localStorage)
+            func: () => {
+                const data = {};
+                for (let i = 0; i < window.localStorage.length; i++) {
+                    const key = window.localStorage.key(i);
+                    const val = window.localStorage.getItem(key) || "";
+                    if (val.length < 5000 && !key.toLowerCase().includes("cache") && !key.toLowerCase().includes("history") && key !== "redux-persist" && !key.includes("AMap")) {
+                        data[key] = val;
+                    }
+                }
+                return JSON.stringify(data);
+            }
         });
         return JSON.parse(results[0].result);
     } catch (e) {
@@ -52,6 +62,7 @@ async function setQccLocalStorage(tabId, lsData) {
         target: { tabId },
         func: (dataStr) => {
             window.localStorage.clear();
+            window.sessionStorage.clear(); // 新增：清除 sessionStorage 以防止其他账号的退出状态残留
             const data = JSON.parse(dataStr);
             for (let key in data) {
                 window.localStorage.setItem(key, data[key]);
@@ -153,6 +164,7 @@ addCurrentBtn.addEventListener("click", async () => {
 
         alert("保存/更新成功！");
         renderAccounts();
+        chrome.runtime.sendMessage({ action: "triggerSync" });
     } catch (e) {
         console.error(e);
         alert("操作失败: " + e.message);
@@ -353,6 +365,7 @@ async function deleteAccount(accountId) {
         await chrome.storage.local.set({ accounts: storage.accounts });
     }
     renderAccounts();
+    chrome.runtime.sendMessage({ action: "triggerSync" });
 }
 
 // 修改账号备注
@@ -367,6 +380,7 @@ async function editAccountName(accountId) {
         acc.savedAt = Date.now(); // 极其关键：更新同步时间点，方便另一台电脑判定覆盖
         await chrome.storage.local.set({ accounts: storage.accounts });
         renderAccounts();
+        chrome.runtime.sendMessage({ action: "triggerSync" });
     }
 }
 
@@ -609,8 +623,18 @@ async function putManifest(baseUrl, headers, manifest) {
 
 // 写入单个账号文件（去除非必要 cookie 字段以减小体积）
 async function putAccount(baseUrl, headers, acc) {
+    const cleanLs = {};
+    if (acc.localStorage) {
+        for (let k in acc.localStorage) {
+            const v = acc.localStorage[k];
+            if (v && v.length < 5000 && !k.toLowerCase().includes("cache") && !k.toLowerCase().includes("history") && k !== "redux-persist" && !k.includes("AMap")) {
+                cleanLs[k] = v;
+            }
+        }
+    }
     const slim = {
         ...acc,
+        localStorage: cleanLs, // 恢复核心登录指纹，只剔除体积庞大的缓存数据
         cookies: (acc.cookies || []).map(c => ({
             name: c.name, value: c.value, domain: c.domain,
             path: c.path, secure: c.secure, sameSite: c.sameSite,

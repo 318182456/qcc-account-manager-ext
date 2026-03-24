@@ -14,6 +14,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === "resetRenewal") {
         console.log("手动触发保活请求或重置保活时机...");
         performRenewalFetch();
+    } else if (message.action === "triggerSync") {
+        console.log("前端操作触发立即 WebDAV 同步...");
+        performAutoSync().catch(console.error);
     }
 });
 
@@ -179,8 +182,16 @@ async function performAutoSync() {
             const wasUploaded = lastUploadAt[acc.id] || 0;
 
             if (localTime > wasUploaded && localTime > remoteTime) {
-                const slim = { ...acc, cookies: (acc.cookies || []).map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, secure: c.secure, sameSite: c.sameSite, expirationDate: c.expirationDate })) };
-                delete slim.localStorage; // 核心修复：剔除体积庞大的 localStorage 缓存，只同步核心账号信息和 Cookie
+                const cleanLs = {};
+                if (acc.localStorage) {
+                    for (let k in acc.localStorage) {
+                        const v = acc.localStorage[k];
+                        if (v && v.length < 5000 && !k.toLowerCase().includes("cache") && !k.toLowerCase().includes("history") && k !== "redux-persist" && !k.includes("AMap")) {
+                            cleanLs[k] = v;
+                        }
+                    }
+                }
+                const slim = { ...acc, localStorage: cleanLs, cookies: (acc.cookies || []).map(c => ({ name: c.name, value: c.value, domain: c.domain, path: c.path, secure: c.secure, sameSite: c.sameSite, expirationDate: c.expirationDate })) };
 
                 const h2 = { ...headers, "Content-Type": "application/json" };
                 await abortFetch(baseUrl + acc.id + ".json", "PUT", h2, JSON.stringify(slim));
