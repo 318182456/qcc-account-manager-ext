@@ -112,7 +112,7 @@ addCurrentBtn.addEventListener("click", async () => {
         let maxExpiry = 0;
         let hasCoreCookie = false;
         for (let c of cookies) {
-            if (["QCCSESSID", "qcc_did", "Token", "acw_tc"].includes(c.name)) {
+            if (["QCCSESSID", "Token"].includes(c.name)) {
                 if (c.expirationDate && c.expirationDate > maxExpiry) {
                     maxExpiry = c.expirationDate;
                 }
@@ -190,7 +190,7 @@ async function renderAccounts() {
                 let liveMax = 0;
                 let hasCore = false;
                 for (let c of liveCookies) {
-                    if (["QCCSESSID", "qcc_did", "Token", "acw_tc"].includes(c.name)) {
+                    if (["QCCSESSID", "Token"].includes(c.name)) {
                         if (c.expirationDate && c.expirationDate > liveMax) liveMax = c.expirationDate;
                         hasCore = true;
                     }
