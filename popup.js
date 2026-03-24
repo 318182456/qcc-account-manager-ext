@@ -11,8 +11,7 @@ const currentAccountText = document.getElementById("currentAccountText");
 const accountList = document.getElementById("accountList");
 const checkAllBtn = document.getElementById("checkAllBtn");
 const emptyState = document.getElementById("emptyState");
-const downloadSyncBtn = document.getElementById("downloadSyncBtn");
-const uploadSyncBtn = document.getElementById("uploadSyncBtn");
+const syncBtn = document.getElementById("syncBtn");
 const openOptionsBtn = document.getElementById("openOptionsBtn");
 
 // 格式化过期时间
@@ -84,87 +83,88 @@ async function clearAllQccCookies() {
     await Promise.all(promises);
 }
 
+// 保存核心逻辑
+async function performSaveAccount(nameToSave) {
+    const tab = await getActiveQccTab();
+    if (!tab) throw new Error("不在企查查页面或未加载完毕。");
+
+    const cookies = await chrome.cookies.getAll({ domain: "qcc.com" });
+    const lsData = await getQccLocalStorage(tab.id);
+
+    let maxExpiry = 0;
+    let hasCoreCookie = false;
+    for (let c of cookies) {
+        if (["QCCSESSID", "Token"].includes(c.name)) {
+            if (c.expirationDate && c.expirationDate > maxExpiry) {
+                maxExpiry = c.expirationDate;
+            }
+            hasCoreCookie = true;
+        }
+    }
+
+    const isLoggedOut = !lsData['_l_KPLiPs'] && (maxExpiry === 0 || !hasCoreCookie);
+    let statusText = "正常在线 (本地更新)";
+
+    if (isLoggedOut) {
+        maxExpiry = Math.floor(Date.now() / 1000) - 1;
+        statusText = "已注销 (无登录凭证)";
+    } else if (!hasCoreCookie || maxExpiry === 0) {
+        maxExpiry = Math.floor(Date.now() / 1000) + 15 * 24 * 3600;
+    }
+
+    const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
+
+    let accountId;
+    const existingAccIndex = storage.accounts.findIndex(a => a.id === storage.currentAccountId);
+
+    if (storage.currentAccountId && existingAccIndex !== -1) {
+        accountId = storage.currentAccountId;
+        storage.accounts[existingAccIndex] = {
+            ...storage.accounts[existingAccIndex],
+            name: nameToSave || storage.accounts[existingAccIndex].name,
+            cookies,
+            localStorage: lsData,
+            expiry: maxExpiry,
+            savedAt: Date.now(),
+            lastStatus: statusText,
+            deleted: false
+        };
+    } else {
+        if (!nameToSave) return; // 隐式自动更新时不创建新账号
+        accountId = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString() + Math.random().toString().substring(2, 6));
+        const accountData = {
+            id: accountId,
+            name: nameToSave,
+            cookies,
+            localStorage: lsData,
+            expiry: maxExpiry,
+            savedAt: Date.now(),
+            lastStatus: statusText,
+            deleted: false
+        };
+        storage.accounts.push(accountData);
+    }
+
+    await chrome.storage.local.set({ accounts: storage.accounts, currentAccountId: accountId });
+    chrome.runtime.sendMessage({ action: "triggerSync" });
+}
+
 // 保存当前账号
 addCurrentBtn.addEventListener("click", async () => {
     const name = accNameInput.value.trim();
-    if (!name) {
-        alert("请输入账号备注");
-        return;
-    }
-
-    const tab = await getActiveQccTab();
-    if (!tab) {
-        alert("请在企查查页面 (qcc.com) 且加载完毕后使用此功能！");
-        return;
-    }
+    if (!name) return alert("请输入账号备注");
 
     addCurrentBtn.textContent = "保存中...";
     addCurrentBtn.disabled = true;
 
     try {
-        // 读取 Cookies
-        const cookies = await chrome.cookies.getAll({ domain: QCC_DOMAIN });
+        await performSaveAccount(name);
 
-        // 读取 LocalStorage
-        const lsData = await getQccLocalStorage(tab.id);
-
-        // 获取核心登录凭证的有效期作为账号的真正过期时间
-        let maxExpiry = 0;
-        let hasCoreCookie = false;
-        for (let c of cookies) {
-            if (["QCCSESSID", "Token"].includes(c.name)) {
-                if (c.expirationDate && c.expirationDate > maxExpiry) {
-                    maxExpiry = c.expirationDate;
-                }
-                hasCoreCookie = true;
-            }
-        }
-
-        // 如果没有找到带 expirationDate 的核心 Cookie (可能是 Session 级别或被隐藏)
-        // 给定一个保守的 15 天默认过期时间，避免取到统计 Cookie 的1-2年误导值
-        if (!hasCoreCookie || maxExpiry === 0) {
-            maxExpiry = (Date.now() / 1000) + 15 * 24 * 3600;
-        }
-        const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
-
-        let accountId;
-        const existingAccIndex = storage.accounts.findIndex(a => a.id === storage.currentAccountId);
-
-        if (storage.currentAccountId && existingAccIndex !== -1) {
-            // 更新现有账号
-            accountId = storage.currentAccountId;
-            storage.accounts[existingAccIndex] = {
-                ...storage.accounts[existingAccIndex],
-                name,
-                cookies,
-                localStorage: lsData,
-                expiry: maxExpiry,
-                savedAt: Date.now(),
-                lastStatus: "正常在线 (重新登录)",
-                deleted: false
-            };
-        } else {
-            // 新增全新账号
-            accountId = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString() + Math.random().toString().substring(2, 6));
-            const accountData = {
-                id: accountId,
-                name,
-                cookies,
-                localStorage: lsData,
-                expiry: maxExpiry,
-                savedAt: Date.now()
-            };
-            storage.accounts.push(accountData);
-        }
-
-        await chrome.storage.local.set({ accounts: storage.accounts, currentAccountId: accountId });
-
-        // 如果是更新，保留输入框，否则清空
+        const storage = await chrome.storage.local.get({ currentAccountId: null });
         if (!storage.currentAccountId) accNameInput.value = "";
 
         alert("保存/更新成功！");
         renderAccounts();
-        chrome.runtime.sendMessage({ action: "triggerSync" });
     } catch (e) {
         console.error(e);
         alert("操作失败: " + e.message);
@@ -189,20 +189,41 @@ async function renderAccounts() {
                 const liveCookies = await chrome.cookies.getAll({ domain: "qcc.com" });
                 let liveMax = 0;
                 let hasCore = false;
+                let liveSessId = "";
                 for (let c of liveCookies) {
+                    if (c.name === "QCCSESSID") liveSessId = c.value;
                     if (["QCCSESSID", "Token"].includes(c.name)) {
                         if (c.expirationDate && c.expirationDate > liveMax) liveMax = c.expirationDate;
                         hasCore = true;
                     }
                 }
                 const nowSec = Date.now() / 1000;
-                
-                // 数据库记录中是否已过期
-                const dbExpired = nowSec > currAcc.expiry || (currAcc.lastStatus && currAcc.lastStatus.includes("失效"));
+
+                let dbSessId = "";
+                for (let c of (currAcc.cookies || [])) {
+                    if (c.name === "QCCSESSID") dbSessId = c.value;
+                }
+
+                // 数据库记录中是否已过期或注销
+                const dbExpired = nowSec > currAcc.expiry || (currAcc.lastStatus && (currAcc.lastStatus.includes("失效") || currAcc.lastStatus.includes("已注销")));
+                // 会话是否发生了更换 (比如用户在网页上重新登录了)
+                const cookieChanged = liveSessId && dbSessId && liveSessId !== dbSessId;
+
                 // 浏览器当前是否已经拿到了新的有效票据 (如果 expirationDate 比现在多 2 天以上，或者没设过期日即 Session)
                 const liveValid = hasCore && (liveMax === 0 || liveMax > nowSec + 86400);
 
-                if (dbExpired) {
+                if (liveValid && (cookieChanged || dbExpired)) {
+                    // 自动无感更新，无需用户点击
+                    accountStatusText.textContent = "检测到新凭证，正在自动提取并同步...";
+                    try {
+                        await performSaveAccount(currAcc.name);
+                        return renderAccounts(); // 重新走一次渲染和判断，中止当前渲染
+                    } catch (e) {
+                        console.warn("自动更新静默失败", e);
+                    }
+                }
+
+                if (dbExpired || cookieChanged) {
                     saveBox.style.display = "flex";
                     accNameInput.value = currAcc.name;
                     if (!liveValid) {
@@ -245,28 +266,33 @@ async function renderAccounts() {
         div.className = "account-item";
 
         const isExpired = (Date.now() / 1000) > acc.expiry;
-        const expiryColor = isExpired ? "var(--danger-color)" : "var(--text-secondary)";
         const d = new Date(acc.expiry * 1000);
-        const expiryHTML = isExpired ? "⚠️ 已过期 (需重新登录)" : `过期: ${d.toLocaleDateString()} ${d.toLocaleTimeString("zh-CN", { hour12: false })}`;
+        const expiryStr = isExpired
+            ? "⚠️ 已过期"
+            : `${d.getMonth() + 1}/${d.getDate()} ${d.toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" })} 到期`;
+        const expiryColor = isExpired ? "var(--danger)" : "var(--text-dim)";
         const isCurrent = acc.id === storage.currentAccountId;
 
         const lastStatusText = acc.lastStatus || (isCurrent ? accountStatusText.textContent : "未检测");
-        const statusColor = lastStatusText.includes("正常") ? "green" : (lastStatusText.includes("未") ? "var(--text-secondary)" : "var(--danger-color)");
+        const isNormal = lastStatusText.includes("正常");
+        const isUnknown = lastStatusText.includes("未") || lastStatusText.includes("检测");
+        const statusDot = isNormal ? "var(--success)" : isUnknown ? "var(--text-dim)" : "var(--danger)";
 
         div.innerHTML = `
-            <div class="account-header" style="display: flex; flex-direction: column; align-items: stretch; gap: 6px; margin-bottom: 10px;">
-                <div style="display: flex; justify-content: space-between; align-items: center;">
-                    <span class="account-name" style="font-weight: 600; font-size: 14px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${acc.name}</span>
-                    <button class="edit-btn" data-id="${acc.id}" style="padding: 2px 6px; font-size: 10px; border: 1px solid var(--border-color); background: #fff; cursor: pointer; border-radius: 4px; color: var(--text-secondary); white-space: nowrap; outline: none; box-sizing: border-box; height: 20px;">修改备注</button>
+            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                <div style="display:flex; align-items:center; gap:7px; min-width:0;">
+                    <span style="width:7px;height:7px;border-radius:50%;background:${statusDot};flex-shrink:0;margin-top:2px;"></span>
+                    <span style="font-weight:600;font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px;">${acc.name}</span>
                 </div>
-                <div style="display: flex; justify-content: space-between; align-items: center; font-size: 11px;">
-                    <div style="color: ${statusColor}; font-weight: 500;" id="status-${acc.id}">状态: ${lastStatusText}</div>
-                    <div class="account-expiry" style="color: ${expiryColor}; white-space: nowrap;">${expiryHTML}</div>
-                </div>
+                <button class="edit-btn" data-id="${acc.id}" style="background:transparent;border:none;color:var(--text-dim);font-size:11px;padding:0 2px;cursor:pointer;flex-shrink:0;font-weight:400;">✏️</button>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:5px; font-size:11px;">
+                <span style="color:${statusDot}; font-weight:500;" id="status-${acc.id}">${lastStatusText}</span>
+                <span style="color:${expiryColor};">${expiryStr}</span>
             </div>
             <div class="account-actions">
-                <button class="primary-btn switch-btn" data-id="${acc.id}" ${isCurrent ? 'disabled style="background:#80868b;border-color:#80868b;cursor:not-allowed;"' : ''}>${isCurrent ? '正在使用' : (isExpired ? '重新登录' : '切换')}</button>
-                <button class="secondary-btn check-btn" data-id="${acc.id}">检测连通</button>
+                <button class="primary-btn switch-btn" data-id="${acc.id}" ${isCurrent ? 'disabled style="background:#94a3b8;box-shadow:none;cursor:not-allowed;"' : ''}>${isCurrent ? "正在使用" : (isExpired ? "🔑 重登" : "切换")}</button>
+                <button class="secondary-btn check-btn" data-id="${acc.id}">检测</button>
                 <button class="danger-btn delete-btn" data-id="${acc.id}">删除</button>
             </div>
         `;
@@ -416,7 +442,10 @@ async function checkSingleAccount(accountId) {
         let resultStatus = "正常";
         let statusColor = "green";
 
-        if (res.status === 425) {
+        if (res.redirected && res.url.includes("login")) {
+            resultStatus = "已注销";
+            statusColor = "var(--text-secondary)";
+        } else if (res.status === 425) {
             resultStatus = "受阻 (425限制)";
             statusColor = "var(--danger-color)";
         } else if (res.status === 401 || res.status === 403) {
@@ -430,13 +459,13 @@ async function checkSingleAccount(accountId) {
         targetAcc.lastStatus = resultStatus;
         await chrome.storage.local.set({ accounts: storage.accounts });
         if (statusEl) {
-            statusEl.textContent = "状态: " + resultStatus;
+            statusEl.textContent = resultStatus;
             statusEl.style.color = statusColor;
         }
     } catch (e) {
         console.warn("单体测试抛出错误:", e);
         if (statusEl) {
-            statusEl.textContent = "状态: 测不准";
+            statusEl.textContent = "测不准";
             statusEl.style.color = "var(--text-secondary)";
         }
     } finally {
@@ -510,7 +539,11 @@ async function checkAccountStatus() {
     try {
         // 增测探针：企查查常在被封控时抛出 425 状态码
         const res = await fetch("https://r.qcc.com/monitor/overview");
-        if (res.status === 425) {
+        if (res.redirected && res.url.includes("login")) {
+            accountStatusText.textContent = "已注销";
+            accountStatusText.style.color = "var(--text-secondary)";
+            return;
+        } else if (res.status === 425) {
             accountStatusText.textContent = "访问限制";
             accountStatusText.style.color = "var(--danger-color)";
             return;
@@ -539,7 +572,7 @@ async function checkAccountStatus() {
             func: () => {
                 const text = document.body.innerText || "";
                 const url = window.location.href;
-                if (url.includes("login")) return "未登录";
+                if (url.includes("login")) return "已注销";
                 if (url.includes("verify") || (text.includes("验证码") && (text.includes("安全") || text.includes("频繁")))) return "受限 (频繁验证)";
                 if (text.includes("超出今日") || text.includes("额度已用完") || text.includes("达到上限") || text.includes("访问过于频繁")) return "额度超限或受阻";
                 return "正常在线";
@@ -549,7 +582,7 @@ async function checkAccountStatus() {
         accountStatusText.textContent = status;
         if (status === "正常在线") {
             accountStatusText.style.color = "green";
-        } else if (status === "未登录") {
+        } else if (status === "已注销") {
             accountStatusText.style.color = "var(--text-secondary)";
         } else {
             accountStatusText.style.color = "var(--danger-color)";
@@ -569,206 +602,28 @@ if (openOptionsBtn) {
     });
 }
 
-// 获取经过验证的 WebDAV 配置，失败时弹提示并返回 null
-async function getWebDAVConfig(silent = false) {
-    const storage = await chrome.storage.local.get({ webdav: null });
-    const config = storage.webdav;
-    if (!config || !config.url) {
-        if (!silent) alert("请先点击右下角【⚙️配置】设置您的 WebDAV 信息！");
-        return null;
-    }
-    // 确保 baseUrl 以 / 结尾
-    const baseUrl = config.url.endsWith("/") ? config.url : config.url + "/";
-    const headers = {};
-    if (config.user || config.pass) {
-        headers["Authorization"] = "Basic " + btoa(config.user + ":" + config.pass);
-    }
-    return { baseUrl, headers };
-}
-
-// 带超时的单次 WebDAV 请求
-async function davFetch(url, method, headers, body = null) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(new DOMException("请求超时(>60s)，请检查 NAS 网络或改用内网地址", "AbortError")), 60000);
-    try {
-        const res = await fetch(url, { method, headers, body, signal: ctrl.signal });
-        clearTimeout(t);
-        return res;
-    } catch (e) {
-        clearTimeout(t);
-        throw e;
-    }
-}
-
-// 读取远端 manifest.json，返回数组或 null
-async function fetchManifest(baseUrl, headers) {
-    try {
-        const res = await davFetch(baseUrl + "manifest.json", "GET", headers);
-        if (res.status === 404) return [];
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const text = await res.text();
-        return text ? JSON.parse(text) : [];
-    } catch (e) {
-        if (e.name === "AbortError") throw new Error("超时，请检查 NAS 网络连接");
-        throw e;
-    }
-}
-
-// 写入远端 manifest.json
-async function putManifest(baseUrl, headers, manifest) {
-    const h = { ...headers, "Content-Type": "application/json" };
-    const res = await davFetch(baseUrl + "manifest.json", "PUT", h, JSON.stringify(manifest));
-    if (!res.ok) throw new Error("manifest PUT 失败 HTTP " + res.status);
-}
-
-// 写入单个账号文件（去除非必要 cookie 字段以减小体积）
-async function putAccount(baseUrl, headers, acc) {
-    const cleanLs = {};
-    if (acc.localStorage) {
-        for (let k in acc.localStorage) {
-            const v = acc.localStorage[k];
-            if (v && v.length < 5000 && !k.toLowerCase().includes("cache") && !k.toLowerCase().includes("history") && k !== "redux-persist" && !k.includes("AMap")) {
-                cleanLs[k] = v;
-            }
-        }
-    }
-    const slim = {
-        ...acc,
-        localStorage: cleanLs, // 恢复核心登录指纹，只剔除体积庞大的缓存数据
-        cookies: (acc.cookies || []).map(c => ({
-            name: c.name, value: c.value, domain: c.domain,
-            path: c.path, secure: c.secure, sameSite: c.sameSite,
-            expirationDate: c.expirationDate
-        }))
-    };
-    const h = { ...headers, "Content-Type": "application/json" };
-    const res = await davFetch(baseUrl + acc.id + ".json", "PUT", h, JSON.stringify(slim));
-    if (!res.ok) throw new Error("账号 PUT 失败 HTTP " + res.status);
-}
-
-// 读取单个账号文件
-async function fetchAccount(baseUrl, headers, id) {
-    const res = await davFetch(baseUrl + id + ".json", "GET", headers);
-    if (res.status === 404) return null;
-    if (!res.ok) throw new Error("账号 GET 失败 HTTP " + res.status);
-    return JSON.parse(await res.text());
-}
-
-// ────── 手动备份按钮（只上传本地有变化的账号）──────
-if (uploadSyncBtn) {
-    uploadSyncBtn.addEventListener("click", async () => {
-        if (!confirm("将把本地有更新的账号增量推送到云端。\n确认备份吗？")) return;
-        uploadSyncBtn.disabled = true;
-        uploadSyncBtn.textContent = "上传中...";
-
+if (syncBtn) {
+    syncBtn.addEventListener("click", async () => {
+        syncBtn.disabled = true;
+        syncBtn.textContent = "同步中...";
         try {
-            const cfg = await getWebDAVConfig();
-            if (!cfg) { uploadSyncBtn.disabled = false; uploadSyncBtn.textContent = "⬆️ 备份到云端"; return; }
-            const { baseUrl, headers } = cfg;
-
-            const storage = await chrome.storage.local.get({ accounts: [], lastUploadAt: {} });
-            const lastUploadAt = storage.lastUploadAt || {};
-
-            // 读取远端 manifest，得到远端的 savedAt 索引
-            const remoteManifest = await fetchManifest(baseUrl, headers);
-            const remoteMap = new Map(remoteManifest.map(m => [m.id, m.savedAt || 0]));
-
-            let uploaded = 0;
-            const newLastUpload = { ...lastUploadAt };
-            const newManifest = [...remoteManifest];
-            const manifestMap = new Map(newManifest.map((m, i) => [m.id, i]));
-
-            for (const acc of storage.accounts) {
-                const localTime = acc.savedAt || ((acc.expiry || 0) * 1000);
-                const remoteTime = remoteMap.get(acc.id) || 0;
-                const wasUploaded = lastUploadAt[acc.id] || 0;
-
-                // 只上传"比上次上传新"或"比云端更新"的账号
-                if (localTime > wasUploaded || localTime > remoteTime) {
-                    await putAccount(baseUrl, headers, acc);
-
-                    newLastUpload[acc.id] = localTime;
-                    uploaded++;
-
-                    // 更新 manifest 条目
-                    const entry = { id: acc.id, name: acc.name, savedAt: localTime, deleted: acc.deleted || false };
-                    if (manifestMap.has(acc.id)) {
-                        newManifest[manifestMap.get(acc.id)] = entry;
-                    } else {
-                        newManifest.push(entry);
-                        manifestMap.set(acc.id, newManifest.length - 1);
-                    }
+            const response = await chrome.runtime.sendMessage({ action: "triggerSync" });
+            if (response && response.success) {
+                if (response.changed) {
+                    alert("双向同步完成，数据有更新！");
+                    renderAccounts();
+                } else {
+                    alert("双向同步完成，云端和本地均已是最新状态。");
                 }
-            }
-
-            await putManifest(baseUrl, headers, newManifest);
-            await chrome.storage.local.set({ lastUploadAt: newLastUpload });
-            alert(`备份完成！共推送了 ${uploaded} 个有变化的账号。`);
-        } catch (e) {
-            if (e.name === "AbortError") {
-                alert(e.message || "请求超时，请检查 NAS 网络连接或改用内网 IP 地址");
             } else {
-                alert("备份失败：" + e.message);
+                alert("同步失败: " + (response && response.error ? response.error : "请检查是否已在【配置】页面填好服务器参数！"));
             }
-        }
-
-        uploadSyncBtn.disabled = false;
-        uploadSyncBtn.textContent = "⬆️ 备份到云端";
-    });
-}
-
-// ────── 手动下载按钮（只下载云端比本地新的账号）──────
-if (downloadSyncBtn) {
-    downloadSyncBtn.addEventListener("click", async () => {
-        if (!confirm("将从云端拉取比本地更新的账号进行合并。\n确定同步吗？")) return;
-        downloadSyncBtn.disabled = true;
-        downloadSyncBtn.textContent = "拉取中...";
-
-        try {
-            const cfg = await getWebDAVConfig();
-            if (!cfg) { downloadSyncBtn.disabled = false; downloadSyncBtn.textContent = "⬇️ 从云端同步"; return; }
-            const { baseUrl, headers } = cfg;
-
-            const remoteManifest = await fetchManifest(baseUrl, headers);
-            if (!remoteManifest.length) {
-                alert("云端尚未备份过数据，请先上传一次！");
-                downloadSyncBtn.disabled = false;
-                downloadSyncBtn.textContent = "⬇️ 从云端同步";
-                return;
-            }
-
-            const storage = await chrome.storage.local.get({ accounts: [] });
-            const localMap = new Map(storage.accounts.map(a => [a.id, a]));
-
-            let downloaded = 0;
-            for (const entry of remoteManifest) {
-                const localAcc = localMap.get(entry.id);
-                const localTime = localAcc ? (localAcc.savedAt || ((localAcc.expiry || 0) * 1000)) : 0;
-                const remoteTime = entry.savedAt || 0;
-
-                if (remoteTime > localTime) {
-                    // 需要更新，下载完整数据
-                    const remoteAcc = await fetchAccount(baseUrl, headers, entry.id);
-                    if (remoteAcc) {
-                        localMap.set(entry.id, remoteAcc);
-                        downloaded++;
-                    }
-                }
-            }
-
-            await chrome.storage.local.set({ accounts: Array.from(localMap.values()) });
-            alert(`同步完成！共更新了 ${downloaded} 个账号。`);
-            renderAccounts();
         } catch (e) {
-            if (e.name === "AbortError") {
-                alert(e.message || "请求超时，请检查 NAS 网络连接或改用内网 IP 地址");
-            } else {
-                alert("同步失败：" + e.message);
-            }
+            alert("通信失败: " + e.message);
+        } finally {
+            syncBtn.disabled = false;
+            syncBtn.textContent = "🔄 立即同步";
         }
-
-        downloadSyncBtn.disabled = false;
-        downloadSyncBtn.textContent = "⬇️ 从云端同步";
     });
 }
 

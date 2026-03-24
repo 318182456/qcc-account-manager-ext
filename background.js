@@ -16,7 +16,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         performRenewalFetch();
     } else if (message.action === "triggerSync") {
         console.log("前端操作触发立即 WebDAV 同步...");
-        performAutoSync().catch(console.error);
+        performAutoSync()
+            .then(changed => sendResponse({ success: true, changed }))
+            .catch(e => sendResponse({ success: false, error: e.message }));
+        return true; // 声明异步响应
     }
 });
 
@@ -49,10 +52,12 @@ async function performRenewalFetch() {
 
         // 判定本次保活是否因 Session 失效被重定向到 /login 或者直接报错
         let isAlive = true;
+        let isLoggedOut = false;
         if (response.status === 401 || response.status === 403 || response.status === 425) {
             isAlive = false;
         } else if (response.url && response.url.includes("login")) {
             isAlive = false;
+            isLoggedOut = true;
         }
 
         const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
@@ -61,7 +66,7 @@ async function performRenewalFetch() {
             console.warn("当前账号保活发现已掉线！");
             const currIdx = storage.accounts.findIndex(a => a.id === storage.currentAccountId);
             if (currIdx !== -1) {
-                storage.accounts[currIdx].lastStatus = `失效 (${response.status})`;
+                storage.accounts[currIdx].lastStatus = isLoggedOut ? "已注销" : `失效 (${response.status})`;
                 storage.accounts[currIdx].expiry = Math.floor(Date.now() / 1000) - 1; // 强制置为过期
                 await chrome.storage.local.set({ accounts: storage.accounts });
 
@@ -136,9 +141,9 @@ async function performRenewalFetch() {
  */
 async function performAutoSync() {
     const storage = await chrome.storage.local.get({ webdav: null, accounts: [], autoSync: true, lastUploadAt: {} });
-    if (!storage.autoSync) return;
+    if (!storage.autoSync) return false;
     const config = storage.webdav;
-    if (!config || !config.url) return;
+    if (!config || !config.url) return false;
 
     const baseUrl = config.url.endsWith("/") ? config.url : config.url + "/";
     const headers = {};
@@ -228,8 +233,10 @@ async function performAutoSync() {
             await chrome.storage.local.set({ accounts: Array.from(localMap.values()), lastUploadAt: newLastUpload });
             console.log("目录模式双向自动同步完成。");
         }
+        return changed;
     } catch (e) {
         console.error("后台自动同步失败:", e);
+        return false;
     }
 }
 
@@ -290,8 +297,12 @@ async function performAllAccountsRenewal() {
             });
 
             let isAlive = true;
-            if (res.status === 401 || res.status === 403 || res.status === 425 || (res.url && res.url.includes("login"))) {
+            let isLoggedOut = false;
+            if (res.status === 401 || res.status === 403 || res.status === 425) {
                 isAlive = false;
+            } else if (res.url && res.url.includes("login")) {
+                isAlive = false;
+                isLoggedOut = true;
             }
 
             // 安全更新：重新从存储中读取最新状态，防止在我们执行漫长网络请求/等待时，其它端同步了删除指令
@@ -328,7 +339,7 @@ async function performAllAccountsRenewal() {
                         currentCookies.push(...newCookies);
                     }
                 } else {
-                    freshDbAcc.lastStatus = `失效 (${res.status})`;
+                    freshDbAcc.lastStatus = isLoggedOut ? "已注销" : `失效 (${res.status})`;
                     freshDbAcc.expiry = Math.floor(Date.now() / 1000) - 1;
                 }
                 await chrome.storage.local.set({ accounts: freshStorage.accounts });
