@@ -139,6 +139,23 @@ async function performRenewalFetch() {
  * 后台定时双向同步 - 目录模式（manifest.json + uuid.json）
  * 只传输 savedAt 发生变化的账号文件，大幅减少流量
  */
+// 获取/初始化当前设备 ID 及名称
+async function getOrCreateDeviceInfo() {
+    let { deviceId, deviceName } = await chrome.storage.local.get({ deviceId: null, deviceName: null });
+    if (!deviceId) {
+        deviceId = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+        // 从 UserAgent 中提取简短的系统信息作为默认名称
+        const ua = navigator.userAgent;
+        const winMatch = ua.match(/Windows NT (\d+\.\d+)/);
+        const macMatch = ua.match(/Mac OS X ([\d_]+)/);
+        if (winMatch) deviceName = `Windows PC (${winMatch[1]})`;
+        else if (macMatch) deviceName = `Mac (${macMatch[1].replace(/_/g, '.')})`;
+        else deviceName = `Browser`;
+        await chrome.storage.local.set({ deviceId, deviceName });
+    }
+    return { deviceId, deviceName };
+}
+
 async function performAutoSync() {
     const storage = await chrome.storage.local.get({ webdav: null, accounts: [], autoSync: true, lastUploadAt: {} });
     if (!storage.autoSync) return false;
@@ -233,6 +250,29 @@ async function performAutoSync() {
             await chrome.storage.local.set({ accounts: Array.from(localMap.values()), lastUploadAt: newLastUpload });
             console.log("目录模式双向自动同步完成。");
         }
+        // 4. 写入当前设备心跳到 devices.json
+        try {
+            const { deviceId, deviceName } = await getOrCreateDeviceInfo();
+            const devRes = await abortFetch(baseUrl + "devices.json", "GET", headers);
+            let deviceList = [];
+            if (devRes.ok) {
+                const txt = await devRes.text();
+                if (txt) deviceList = JSON.parse(txt);
+            }
+            const nowTs = Date.now();
+            const existing = deviceList.find(d => d.id === deviceId);
+            if (existing) {
+                existing.name = deviceName;
+                existing.lastSyncAt = nowTs;
+            } else {
+                deviceList.push({ id: deviceId, name: deviceName, lastSyncAt: nowTs });
+            }
+            const dh = { ...headers, "Content-Type": "application/json" };
+            await abortFetch(baseUrl + "devices.json", "PUT", dh, JSON.stringify(deviceList));
+        } catch (e) {
+            console.warn("设备心跳写入失败:", e);
+        }
+
         return changed;
     } catch (e) {
         console.error("后台自动同步失败:", e);

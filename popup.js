@@ -632,6 +632,148 @@ if (syncBtn) {
     });
 }
 
+// ─────── Tab 切换 ───────
+document.querySelectorAll(".tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+        const tab = btn.getAttribute("data-tab");
+        document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById("tab-" + tab).classList.add("active");
+        if (tab === "devices") renderDevices();
+    });
+});
+
+// ─────── 设备列表 ───────
+
+/** 格式化时间距离 */
+function formatTimeAgo(ts) {
+    if (!ts) return "从未";
+    const diff = Date.now() - ts;
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return "刚刚";
+    if (mins < 60) return `${mins} 分钟前`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours} 小时前`;
+    const days = Math.floor(hours / 24);
+    return `${days} 天前`;
+}
+
+/** 从 WebDAV 拉取设备列表并渲染 */
+async function renderDevices() {
+    const deviceList = document.getElementById("deviceList");
+    const countBadge = document.getElementById("deviceCountBadge");
+    deviceList.innerHTML = `<div class="empty-state">加载中...</div>`;
+
+    // 获取本机 deviceId
+    const { deviceId, deviceName } = await chrome.storage.local.get({ deviceId: null, deviceName: null });
+
+    // 填充本机名称输入框
+    const deviceNameInput = document.getElementById("deviceNameInput");
+    if (deviceName) deviceNameInput.value = deviceName;
+
+    // 读取 WebDAV 配置
+    const { webdav } = await chrome.storage.local.get({ webdav: null });
+    if (!webdav || !webdav.url) {
+        deviceList.innerHTML = `<div class="empty-state">请先在⚙️配置页填写 WebDAV 参数。</div>`;
+        countBadge.textContent = "0";
+        return;
+    }
+
+    const baseUrl = webdav.url.endsWith("/") ? webdav.url : webdav.url + "/";
+    const headers = {};
+    if (webdav.user || webdav.pass) {
+        headers["Authorization"] = "Basic " + btoa(webdav.user + ":" + webdav.pass);
+    }
+
+    try {
+        const res = await fetch(baseUrl + "devices.json", { headers });
+        if (!res.ok) {
+            deviceList.innerHTML = `<div class="empty-state">暂无设备记录（首次同步后自动生成）。</div>`;
+            countBadge.textContent = "0";
+            return;
+        }
+        const devices = JSON.parse(await res.text());
+        countBadge.textContent = devices.length;
+        deviceList.innerHTML = "";
+
+        // 按最后同步时间降序排列
+        devices.sort((a, b) => (b.lastSyncAt || 0) - (a.lastSyncAt || 0));
+
+        devices.forEach(dev => {
+            const isSelf = dev.id === deviceId;
+            const item = document.createElement("div");
+            item.className = "device-item" + (isSelf ? " is-self" : "");
+
+            const syncTime = formatTimeAgo(dev.lastSyncAt);
+            const syncFull = dev.lastSyncAt ? new Date(dev.lastSyncAt).toLocaleString() : "—";
+
+            // 从设备名推断图标
+            const name = dev.name || "未知设备";
+            const icon = /windows/i.test(name) ? "🖥️" : /mac/i.test(name) ? "💻" : "📱";
+
+            item.innerHTML = `
+                <span class="device-icon">${icon}</span>
+                <div class="device-info">
+                    <div class="device-name">${name}</div>
+                    <div class="device-meta" title="${syncFull}">最后同步: ${syncTime}</div>
+                </div>
+                ${isSelf ? '<span class="device-self-badge">本机</span>' : ""}
+            `;
+            deviceList.appendChild(item);
+        });
+    } catch (e) {
+        deviceList.innerHTML = `<div class="empty-state">读取失败: ${e.message}</div>`;
+        countBadge.textContent = "—";
+    }
+}
+
+/** 刷新按钮 */
+document.getElementById("refreshDevicesBtn").addEventListener("click", () => renderDevices());
+
+/** 保存本机名称 */
+document.getElementById("saveDeviceNameBtn").addEventListener("click", async () => {
+    const input = document.getElementById("deviceNameInput");
+    const newName = input.value.trim();
+    if (!newName) return;
+
+    const btn = document.getElementById("saveDeviceNameBtn");
+    btn.textContent = "保存中...";
+    btn.disabled = true;
+
+    try {
+        const { deviceId } = await chrome.storage.local.get({ deviceId: null });
+        await chrome.storage.local.set({ deviceName: newName });
+
+        // 若已有 WebDAV 配置，直接更新 devices.json
+        const { webdav } = await chrome.storage.local.get({ webdav: null });
+        if (webdav && webdav.url && deviceId) {
+            const baseUrl = webdav.url.endsWith("/") ? webdav.url : webdav.url + "/";
+            const headers = {};
+            if (webdav.user || webdav.pass) {
+                headers["Authorization"] = "Basic " + btoa(webdav.user + ":" + webdav.pass);
+            }
+            const res = await fetch(baseUrl + "devices.json", { headers });
+            let devices = [];
+            if (res.ok) devices = JSON.parse(await res.text());
+            const existing = devices.find(d => d.id === deviceId);
+            if (existing) { existing.name = newName; existing.lastSyncAt = Date.now(); }
+            else devices.push({ id: deviceId, name: newName, lastSyncAt: Date.now() });
+            await fetch(baseUrl + "devices.json", {
+                method: "PUT",
+                headers: { ...headers, "Content-Type": "application/json" },
+                body: JSON.stringify(devices)
+            });
+        }
+        await renderDevices();
+    } catch (e) {
+        alert("保存失败: " + e.message);
+    } finally {
+        btn.textContent = "保存";
+        btn.disabled = false;
+    }
+});
+
 // 初始化
 document.addEventListener("DOMContentLoaded", () => {
     renderAccounts();

@@ -11,29 +11,60 @@
     <div class="container">
         <header>
             <h2>🏢 企查查多账号管理</h2>
+            <div class="tab-bar">
+                <button class="tab-btn active" data-tab="accounts">📋 账号</button>
+                <button class="tab-btn" data-tab="devices">🖥️ 设备</button>
+            </div>
         </header>
 
-        <div class="actions-card">
-            <div class="status-indicator">
-                <div>当前使用: <span id="currentAccountText">未知 / 未保存</span></div>
-                <div>当前状态: <span id="accountStatusText" style="color: var(--text-muted) !important; font-weight: 500;">检测中...</span></div>
+        <!-- 账号 Tab -->
+        <div id="tab-accounts" class="tab-panel active">
+            <div class="actions-card">
+                <div class="status-indicator">
+                    <div>当前使用: <span id="currentAccountText">未知 / 未保存</span></div>
+                    <div>当前状态: <span id="accountStatusText" style="color: var(--text-muted) !important; font-weight: 500;">检测中...</span></div>
+                </div>
+                <div id="saveBox" style="display: flex; flex-direction: column; gap: 8px;">
+                    <input type="text" id="accNameInput" placeholder="输入当前账号备注 (如: 手机号)" />
+                    <button id="addCurrentBtn" class="primary-btn">保存当前账号信息</button>
+                </div>
+                <button id="clearAndAddNewBtn" class="danger-text">＋ 添加新账号</button>
             </div>
-            <div id="saveBox" style="display: flex; flex-direction: column; gap: 8px;">
-                <input type="text" id="accNameInput" placeholder="输入当前账号备注 (如: 手机号)" />
-                <button id="addCurrentBtn" class="primary-btn">保存当前账号信息</button>
+
+            <div class="list-section">
+                <div class="list-header">
+                    <h3>已保存的账号</h3>
+                    <button id="checkAllBtn" class="secondary-btn check-all-btn">⚡ 一键测活</button>
+                </div>
+                <div id="accountList" class="account-list">
+                </div>
+                <div id="emptyState" class="empty-state" style="display: none;">
+                    暂无保存的账号
+                </div>
             </div>
-            <button id="clearAndAddNewBtn" class="danger-text">＋ 添加新账号</button>
         </div>
 
-        <div class="list-section">
-            <div class="list-header">
-                <h3>已保存的账号</h3>
-                <button id="checkAllBtn" class="secondary-btn check-all-btn">⚡ 一键测活</button>
-            </div>
-            <div id="accountList" class="account-list">
-            </div>
-            <div id="emptyState" class="empty-state" style="display: none;">
-                暂无保存的账号
+        <!-- 设备 Tab -->
+        <div id="tab-devices" class="tab-panel">
+            <div class="device-section">
+                <div class="device-header-row">
+                    <div class="device-title-group">
+                        <span id="deviceCountBadge" class="device-count-badge">—</span>
+                        <span class="device-label">台设备已连接</span>
+                    </div>
+                    <button id="refreshDevicesBtn" class="secondary-btn" style="padding:4px 10px;font-size:11px;">刷新</button>
+                </div>
+                <div id="deviceList" class="device-list">
+                    <div class="empty-state">正在加载...</div>
+                </div>
+                <div class="device-tip">
+                    💡 通过 WebDAV 同步的设备将自动出现在此列表。
+                </div>
+                <div class="device-self-row">
+                    <span class="device-self-label">本机名称</span>
+                    <input type="text" id="deviceNameInput" placeholder="为本机起个名字" style="flex:1;font-size:12px;padding:5px 9px;" />
+                    <button id="saveDeviceNameBtn" class="primary-btn" style="width:auto;padding:5px 12px;font-size:12px;">保存</button>
+                </div>
             </div>
         </div>
 
