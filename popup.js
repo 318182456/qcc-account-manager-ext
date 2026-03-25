@@ -21,13 +21,19 @@ function formatExpiry(timestampSec) {
     return date.toLocaleString();
 }
 
-// 检查是否在企查查页面
+// 检查当前激活标签是否是企查查页面
 async function getActiveQccTab() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab || !tab.url.includes(QCC_DOMAIN)) {
         return null;
     }
     return tab;
+}
+
+// 查找任意已打开的企查查标签（不限激活状态，用于 LocalStorage 读取）
+async function getAnyQccTab() {
+    const tabs = await chrome.tabs.query({ url: "*://*.qcc.com/*" });
+    return tabs.length > 0 ? tabs[0] : null;
 }
 
 // 从当前页面获取 LocalStorage
@@ -176,82 +182,80 @@ addCurrentBtn.addEventListener("click", async () => {
 
 // 渲染账号列表
 async function renderAccounts() {
-    const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
+    let storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
+
+    // ── 阶段1：Cookie 匹配（DOM 操作前完成，避免闪屏）──
+    const liveCookies = await chrome.cookies.getAll({ domain: "qcc.com" });
+    let liveWBKey = "", liveSessId = "";
+    let liveMax = 0, hasCore = false;
+    for (let c of liveCookies) {
+        if (c.name === "_c_WBKFRo") liveWBKey = c.value;
+        if (c.name === "QCCSESSID") liveSessId = c.value;
+        if (["QCCSESSID", "Token"].includes(c.name)) {
+            if (c.expirationDate && c.expirationDate > liveMax) liveMax = c.expirationDate;
+            hasCore = true;
+        }
+    }
+    const nowSec = Date.now() / 1000;
+    const liveValid = hasCore && (liveMax === 0 || liveMax > nowSec + 86400);
+
+    // 全量账号中查找 Cookie 匹配（_c_WBKFRo 优先，QCCSESSID 兜底）
+    const matchedAcc = storage.accounts.find(acc => {
+        if (acc.deleted) return false;
+        const accWBKey = (acc.cookies || []).find(c => c.name === "_c_WBKFRo")?.value || "";
+        const accSessId = (acc.cookies || []).find(c => c.name === "QCCSESSID")?.value || "";
+        if (liveWBKey && accWBKey) return liveWBKey === accWBKey;
+        if (liveSessId && accSessId) return liveSessId === accSessId;
+        return false;
+    });
+
+    // 内存中修正 currentAccountId，异步写入存储（不阻塞渲染）
+    if (matchedAcc) {
+        if (matchedAcc.id !== storage.currentAccountId) {
+            storage.currentAccountId = matchedAcc.id;
+            chrome.storage.local.set({ currentAccountId: matchedAcc.id });
+        }
+    } else if (liveValid && storage.currentAccountId) {
+        storage.currentAccountId = null;
+        chrome.storage.local.remove("currentAccountId");
+    }
+
+    // ── 阶段2：单次 DOM 渲染 ──
     accountList.innerHTML = "";
 
-    // 更新顶部当前使用账号显示及控制区块
-    if (storage.currentAccountId) {
-        const currAcc = storage.accounts.find(a => a.id === storage.currentAccountId);
+    const currAcc = matchedAcc
+        || (storage.currentAccountId ? storage.accounts.find(a => a.id === storage.currentAccountId && !a.deleted) : null);
+
+    if (saveBox) {
         if (currAcc) {
             currentAccountText.textContent = currAcc.name;
-            if (saveBox) {
-                // 探测当前实时的 Cookie 状态
-                const liveCookies = await chrome.cookies.getAll({ domain: "qcc.com" });
-                let liveMax = 0;
-                let hasCore = false;
-                let liveSessId = "";
-                for (let c of liveCookies) {
-                    if (c.name === "QCCSESSID") liveSessId = c.value;
-                    if (["QCCSESSID", "Token"].includes(c.name)) {
-                        if (c.expirationDate && c.expirationDate > liveMax) liveMax = c.expirationDate;
-                        hasCore = true;
-                    }
-                }
-                const nowSec = Date.now() / 1000;
+            const dbExpired = nowSec > currAcc.expiry ||
+                (currAcc.lastStatus && (currAcc.lastStatus.includes("失效") || currAcc.lastStatus.includes("已注销")));
 
-                let dbSessId = "";
-                for (let c of (currAcc.cookies || [])) {
-                    if (c.name === "QCCSESSID") dbSessId = c.value;
-                }
-
-                // 数据库记录中是否已过期或注销
-                const dbExpired = nowSec > currAcc.expiry || (currAcc.lastStatus && (currAcc.lastStatus.includes("失效") || currAcc.lastStatus.includes("已注销")));
-                // 会话是否发生了更换 (比如用户在网页上重新登录了)
-                const cookieChanged = liveSessId && dbSessId && liveSessId !== dbSessId;
-
-                // 浏览器当前是否已经拿到了新的有效票据 (如果 expirationDate 比现在多 2 天以上，或者没设过期日即 Session)
-                const liveValid = hasCore && (liveMax === 0 || liveMax > nowSec + 86400);
-
-                if (liveValid && (cookieChanged || dbExpired)) {
-                    // 自动无感更新，无需用户点击
-                    accountStatusText.textContent = "检测到新凭证，正在自动提取并同步...";
-                    try {
-                        await performSaveAccount(currAcc.name);
-                        return renderAccounts(); // 重新走一次渲染和判断，中止当前渲染
-                    } catch (e) {
-                        console.warn("自动更新静默失败", e);
-                    }
-                }
-
-                if (dbExpired || cookieChanged) {
-                    saveBox.style.display = "flex";
-                    accNameInput.value = currAcc.name;
-                    if (!liveValid) {
-                        addCurrentBtn.textContent = "请先在网页登录后再更新";
-                        addCurrentBtn.disabled = true;
-                    } else {
-                        addCurrentBtn.textContent = "更新这个账号";
-                        addCurrentBtn.disabled = false;
-                    }
-                } else {
-                    // 如果账号正常在线并未过期，就不需要显示更新框（恢复原有的干净界面）
-                    saveBox.style.display = "none";
-                }
-            }
-        } else {
-            currentAccountText.textContent = "未知 / 未保存";
-            if (saveBox) {
+            if (liveValid && dbExpired) {
+                // 后台自动更新，不阻塞当前列表渲染
+                accountStatusText.textContent = "检测到新凭证，正在自动提取并同步...";
+                saveBox.style.display = "none";
+                performSaveAccount(currAcc.name)
+                    .then(() => renderAccounts())
+                    .catch(e => console.warn("自动更新失败", e));
+            } else if (dbExpired) {
                 saveBox.style.display = "flex";
-                accNameInput.value = "";
-                addCurrentBtn.textContent = "保存为新账号";
+                accNameInput.value = currAcc.name;
+                addCurrentBtn.textContent = liveValid ? "更新这个账号" : "请先在网页登录后再更新";
+                addCurrentBtn.disabled = !liveValid;
+            } else {
+                saveBox.style.display = "none";
             }
-        }
-    } else {
-        currentAccountText.textContent = "未知 / 未保存";
-        if (saveBox) {
+        } else if (liveValid) {
+            currentAccountText.textContent = "未知 / 未保存";
             saveBox.style.display = "flex";
             accNameInput.value = "";
-            addCurrentBtn.textContent = "保存为新账号";
+            addCurrentBtn.textContent = "保存当前账号";
+            addCurrentBtn.disabled = false;
+        } else {
+            currentAccountText.textContent = "未登录";
+            saveBox.style.display = "none";
         }
     }
 
@@ -283,6 +287,7 @@ async function renderAccounts() {
                 <div style="display:flex; align-items:center; gap:7px; min-width:0;">
                     <span style="width:7px;height:7px;border-radius:50%;background:${statusDot};flex-shrink:0;margin-top:2px;"></span>
                     <span style="font-weight:600;font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px;">${acc.name}</span>
+                    ${isCurrent ? '<span style="font-size:10px;background:rgba(99,102,241,0.2);color:#a5b4fc;border:1px solid rgba(99,102,241,0.4);padding:1px 6px;border-radius:20px;flex-shrink:0;">使用中</span>' : ""}
                 </div>
                 <button class="edit-btn" data-id="${acc.id}" style="background:transparent;border:none;color:var(--text-dim);font-size:11px;padding:0 2px;cursor:pointer;flex-shrink:0;font-weight:400;">✏️</button>
             </div>
@@ -291,7 +296,7 @@ async function renderAccounts() {
                 <span style="color:${expiryColor};">${expiryStr}</span>
             </div>
             <div class="account-actions">
-                <button class="primary-btn switch-btn" data-id="${acc.id}" ${isCurrent ? 'disabled style="background:#94a3b8;box-shadow:none;cursor:not-allowed;"' : ''}>${isCurrent ? "正在使用" : (isExpired ? "🔑 重登" : "切换")}</button>
+                <button class="primary-btn switch-btn" data-id="${acc.id}">${isExpired ? "🔑 重登" : "切换"}</button>
                 <button class="secondary-btn check-btn" data-id="${acc.id}">检测</button>
                 <button class="danger-btn delete-btn" data-id="${acc.id}">删除</button>
             </div>
