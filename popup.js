@@ -774,8 +774,47 @@ document.getElementById("saveDeviceNameBtn").addEventListener("click", async () 
     }
 });
 
+// ─────── 热重载检测 ───────
+// 开发机更新代码后，同步 WebDAV 上的 version.json：{"version": <unix_timestamp>}
+// 其他电脑打开 popup 时若检测到更新，自动重载扩展
+async function checkAndHotReload() {
+    const STORE_KEY = "ext_version";
+    try {
+        const { webdav } = await chrome.storage.local.get({ webdav: null });
+        if (!webdav?.url) return;
+
+        const baseUrl = webdav.url.endsWith("/") ? webdav.url : webdav.url + "/";
+        const headers = {};
+        if (webdav.user || webdav.pass) {
+            headers["Authorization"] = "Basic " + btoa((webdav.user || "") + ":" + (webdav.pass || ""));
+        }
+
+        const res = await fetch(baseUrl + "version.json", { headers, cache: "no-store" });
+        if (!res.ok) return;
+
+        const { version } = await res.json();
+        if (!version) return;
+
+        const { [STORE_KEY]: localVersion } = await chrome.storage.local.get(STORE_KEY);
+
+        if (!localVersion) {
+            // 首次：记录当前版本，不重载
+            await chrome.storage.local.set({ [STORE_KEY]: version });
+            return;
+        }
+
+        if (version > localVersion) {
+            await chrome.storage.local.set({ [STORE_KEY]: version });
+            chrome.runtime.reload(); // 重载扩展，popup 自动关闭
+        }
+    } catch (_) {
+        // 静默失败，不影响正常使用
+    }
+}
+
 // 初始化
 document.addEventListener("DOMContentLoaded", () => {
+    checkAndHotReload(); // 热重载检测（有更新会自动重载并关闭 popup）
     renderAccounts();
     checkAccountStatus();
 });
