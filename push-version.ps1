@@ -49,6 +49,7 @@ $authHeader = @{ "Authorization" = "Basic $encoded" }
 
 # -- Step 1: Sync extension files --
 $codeBase = if ($CodeUrl.EndsWith("/")) { $CodeUrl } else { "$CodeUrl/" }
+$Global:CreatedDirs = New-Object System.Collections.Generic.HashSet[string]
 Write-Host "Syncing extension files to WebDAV..."
 
 foreach ($file in $SyncFiles) {
@@ -57,15 +58,54 @@ foreach ($file in $SyncFiles) {
         Write-Warning "  Skip (not found): $file"
         continue
     }
+    
+    # 自动创建远程目录 (WebDAV MKCOL)
+    $dirPart = Split-Path $file
+    if ($dirPart) {
+        # 兼容多种路径分隔符
+        $subDirs = $dirPart -split '[\\/]' | Where-Object { $_ }
+        $currentPath = $codeBase.TrimEnd('/')
+        foreach ($sub in $subDirs) {
+            # 目录请求通常建议带上末尾斜杠
+            $currentPath += "/$sub/"
+            if (-not $Global:CreatedDirs.Contains($currentPath)) {
+                try {
+                    Write-Host "  MKCOL $sub ..." -ForegroundColor Cyan
+                    # 使用 .NET 原生方法以避开 PowerShell 5.1 对 Method 枚举的限制
+                    $req = [System.Net.HttpWebRequest]::Create($currentPath)
+                    $req.Method = "MKCOL"
+                    $req.Headers.Add("Authorization", $authHeader.Authorization)
+                    $resp = $req.GetResponse()
+                    $resp.Close()
+                } catch {
+                    # 获取状态码，注意 Response 可能为空
+                    $status = -1
+                    if ($_.Exception.InnerException -and $_.Exception.InnerException.Response) {
+                        $status = [int]$_.Exception.InnerException.Response.StatusCode
+                    } elseif ($_.Exception.Response) {
+                        $status = [int]$_.Exception.Response.StatusCode
+                    }
+                    
+                    # 405 (Method Not Allowed) 通常表示目录已存在
+                    if ($status -ne 405 -and $status -ne 201 -and $status -ne 200) {
+                        Write-Warning "  MKCOL $sub notice: Status $status ($($_.Exception.Message))"
+                    }
+                }
+                $Global:CreatedDirs.Add($currentPath) | Out-Null
+            }
+        }
+    }
+
     $remoteUrl = $codeBase + ($file -replace '\\', '/')
+    Write-Host "  PUT -> $remoteUrl" -ForegroundColor Gray
     try {
         $fileBytes = [System.IO.File]::ReadAllBytes($localPath)
-        Invoke-WebRequest -Uri $remoteUrl -Method PUT -Body $fileBytes `
+        $response = Invoke-WebRequest -Uri $remoteUrl -Method PUT -Body $fileBytes `
             -Headers ($authHeader + @{ "Content-Type" = "application/octet-stream" }) `
-            -UseBasicParsing | Out-Null
-        Write-Host "  OK  $file"
+            -UseBasicParsing
+        Write-Host "  OK  $file (Code: $($response.StatusCode))"
     } catch {
-        Write-Warning "  FAIL $file  $_"
+        Write-Warning "  FAIL $file  $($_.Exception.Message)"
     }
 }
 
@@ -74,10 +114,11 @@ $ts          = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $versionBase = if ($VersionUrl.EndsWith("/")) { $VersionUrl } else { "$VersionUrl/" }
 try {
     $bodyBytes = [Text.Encoding]::UTF8.GetBytes("{`"version`": $ts}")
-    Invoke-WebRequest -Uri "${versionBase}version.json" -Method PUT -Body $bodyBytes `
+    $vUrl      = "${versionBase}version.json"
+    $response  = Invoke-WebRequest -Uri $vUrl -Method PUT -Body $bodyBytes `
         -Headers ($authHeader + @{ "Content-Type" = "application/json" }) `
-        -UseBasicParsing | Out-Null
-    Write-Host "`nDone. version = $ts  (remote popup will auto-reload on next open)"
+        -UseBasicParsing
+    Write-Host "`nDone. version = $ts (Code: $($response.StatusCode))"
 } catch {
     Write-Error "Failed to update version.json: $_"
 }
