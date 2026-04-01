@@ -37,7 +37,10 @@ $SyncFiles = @(
     "popup.js",
     "popup.css",
     "options.html",
-    "options.js"
+    "options.js",
+    "shared\constants.js",
+    "shared\utils.js",
+    "icon_notify.png"
 )
 
 $scriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -54,7 +57,7 @@ foreach ($file in $SyncFiles) {
         Write-Warning "  Skip (not found): $file"
         continue
     }
-    $remoteUrl = $codeBase + $file
+    $remoteUrl = $codeBase + ($file -replace '\\', '/')
     try {
         $fileBytes = [System.IO.File]::ReadAllBytes($localPath)
         Invoke-WebRequest -Uri $remoteUrl -Method PUT -Body $fileBytes `
