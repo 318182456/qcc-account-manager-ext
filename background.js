@@ -1,7 +1,7 @@
 const RENEWAL_ALARM_NAME = "qcc-session-renewal";
 const SYNC_ALARM_NAME = "qcc-auto-sync";
 const QCC_INDEX_URL = "https://www.qcc.com/";
-const QCC_PROBE_URL = "https://www.qcc.com/api/datalist/header/account";
+const QCC_PROBE_URL = "https://r.qcc.com/monitor/overview";
 
 // ─── 统一日志工具（自动添加 JST 时间戳）───
 function _ts() {
@@ -72,24 +72,29 @@ function buildBrowseHeaders() {
 }
 
 /**
- * 对指定账号的 Cookie 发起保活探针请求。
- * 先 GET 首页触发 Cookie 刷新，再 GET 鉴权 API 确认 Session 是否仍然活跃。
- * 返回 { isAlive, isLoggedOut, responseStatus }
+ * 探针请求：三重判定 Session 是否存活
+ *   1) HTTP 状态码 / 重定向检测
+ *   2) 响应体内容检测（解析 JSON 或 HTML 是否包含登录态标记）
+ *   3) Cookie 存在性检测（核心 Cookie 是否仍存在）
+ * 返回 { isAlive, isLoggedOut, responseStatus, detail }
  */
 async function probeSession() {
-    // 第一步：GET 首页，让服务器刷新 Session / Set-Cookie
+    // ── 第一步：GET 首页，触发服务器 Set-Cookie ──
     const homepageRes = await fetch(QCC_INDEX_URL, {
         method: "GET",
         headers: buildBrowseHeaders(),
-        credentials: "include" // 确保带上 Cookie
+        credentials: "include"
     });
 
-    // 首页被重定向到 login = 已注销
-    if (homepageRes.url && homepageRes.url.includes("login")) {
-        return { isAlive: false, isLoggedOut: true, responseStatus: homepageRes.status };
+    // 首页被重定向到 login
+    if (homepageRes.redirected && homepageRes.url.includes("login")) {
+        log("[探针] 首页重定向到 login");
+        return { isAlive: false, isLoggedOut: true, responseStatus: homepageRes.status, detail: "首页重定向login" };
     }
 
-    // 第二步：探针 API 请求，真正验证 Session 有效性
+    // ── 第二步：请求需要登录的 API 探针 ──
+    let probeStatus = 0;
+    let probeBody = "";
     try {
         const probeRes = await fetch(QCC_PROBE_URL, {
             method: "GET",
@@ -100,23 +105,61 @@ async function probeSession() {
             },
             credentials: "include"
         });
+        probeStatus = probeRes.status;
 
-        if (probeRes.url && probeRes.url.includes("login")) {
-            return { isAlive: false, isLoggedOut: true, responseStatus: probeRes.status };
-        }
-        if (probeRes.status === 401 || probeRes.status === 403 || probeRes.status === 425) {
-            return { isAlive: false, isLoggedOut: false, responseStatus: probeRes.status };
+        // 重定向到登录页
+        if (probeRes.redirected && probeRes.url.includes("login")) {
+            log("[探针] API 重定向到 login");
+            return { isAlive: false, isLoggedOut: true, responseStatus: probeStatus, detail: "API重定向login" };
         }
 
-        return { isAlive: true, isLoggedOut: false, responseStatus: probeRes.status };
+        // HTTP 状态码异常
+        if (probeStatus === 401 || probeStatus === 403 || probeStatus === 425) {
+            log(`[探针] API 返回异常状态码: ${probeStatus}`);
+            return { isAlive: false, isLoggedOut: false, responseStatus: probeStatus, detail: `HTTP ${probeStatus}` };
+        }
+
+        // 读取响应体内容进行判断
+        probeBody = await probeRes.text();
+
+        try {
+            const json = JSON.parse(probeBody);
+            const s = json.status || json.Status;
+            const msg = json.message || json.Message || "";
+
+            // 企查查实际返回值：
+            //   已注销: {"status":409,"message":"使用该功能需要用户登录"}
+            //   正常:   {"status":435,"message":"未知错误","errcode":""}
+            if (s === 409 || /登录|login|未授权|expired/i.test(msg)) {
+                log(`[探针] API 判定已注销 (status=${s}, message=${msg})`);
+                return { isAlive: false, isLoggedOut: true, responseStatus: probeStatus, detail: `API status=${s}` };
+            }
+            // status=435 或其他非 409 的值，视为 Session 有效
+            log(`[探针] API 判定存活 (status=${s}, message=${msg})`);
+        } catch (_) {
+            // 非 JSON 响应，检查是否是 HTML 登录页
+            if (probeBody.includes("login") && (probeBody.includes("password") || probeBody.includes("密码"))) {
+                log("[探针] API 返回了 HTML 登录页面");
+                return { isAlive: false, isLoggedOut: true, responseStatus: probeStatus, detail: "返回HTML登录页" };
+            }
+        }
     } catch (e) {
-        // 探针失败但首页成功，视为存活（可能是 API 变更）
-        logW("[保活] 探针 API 请求失败，降级使用首页结果:", e.message);
-        if (homepageRes.status === 401 || homepageRes.status === 403 || homepageRes.status === 425) {
-            return { isAlive: false, isLoggedOut: false, responseStatus: homepageRes.status };
-        }
-        return { isAlive: true, isLoggedOut: false, responseStatus: homepageRes.status };
+        logW("[探针] API 请求网络异常:", e.message);
+        // 网络异常不能确定状态，继续用 Cookie 检测兜底
     }
+
+    // ── 第三步：Cookie 存在性兜底检测 ──
+    const cookies = await chrome.cookies.getAll({ domain: "qcc.com" });
+    const hasQCCSESSID = cookies.some(c => c.name === "QCCSESSID" && c.value);
+    const hasToken = cookies.some(c => c.name === "Token" && c.value);
+
+    if (!hasQCCSESSID && !hasToken) {
+        log("[探针] Cookie 兜底检测：QCCSESSID 和 Token 均不存在，判定已注销");
+        return { isAlive: false, isLoggedOut: true, responseStatus: probeStatus, detail: "无核心Cookie" };
+    }
+
+    log(`[探针] 判定存活 (HTTP=${probeStatus}, SESSID=${hasQCCSESSID}, Token=${hasToken}, body=${probeBody.substring(0, 120)})`);
+    return { isAlive: true, isLoggedOut: false, responseStatus: probeStatus, detail: "OK" };
 }
 
 /**
