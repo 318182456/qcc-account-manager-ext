@@ -9,8 +9,10 @@
     "scripting",
     "alarms",
     "activeTab",
+    "tabs",
     "notifications"
   ],
+  "incognito": "split",
   "host_permissions": [
     "*://*.qcc.com/*",
     "<all_urls>"

@@ -3,6 +3,19 @@
  * 依赖 shared/constants.js（需在此文件前加载）
  */
 
+// ─── 时序工具 ───
+
+/** 在 base ± jitter 范围内取随机值（结果不小于 base 的一半） */
+function jitter(base, jitterRange) {
+    const offset = (Math.random() * 2 - 1) * jitterRange;
+    return Math.max(base / 2, base + offset);
+}
+
+/** Promise 化的 sleep */
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // ─── Cookie 工具 ───
 
 /** Cookie 对象 → 完整 URL（用于 chrome.cookies.set/remove） */
@@ -12,16 +25,27 @@ function cookieToUrl(c) {
     return pfx + domain + c.path;
 }
 
-/** 清除所有 QCC Cookie */
-async function clearAllQccCookies() {
-    const cookies = await chrome.cookies.getAll({ domain: QCC_DOMAIN });
-    await Promise.all(cookies.map(c =>
-        chrome.cookies.remove({ url: cookieToUrl(c), name: c.name })
-    ));
+/**
+ * 清除所有 QCC Cookie
+ * @param {string} [storeId] 指定 Cookie 容器；省略则操作默认容器
+ */
+async function clearAllQccCookies(storeId) {
+    const query = { domain: QCC_DOMAIN };
+    if (storeId) query.storeId = storeId;
+    const cookies = await chrome.cookies.getAll(query);
+    await Promise.all(cookies.map(c => {
+        const params = { url: cookieToUrl(c), name: c.name };
+        if (storeId) params.storeId = storeId;
+        return chrome.cookies.remove(params).catch(() => { });
+    }));
 }
 
-/** 批量注入 Cookie 数组到浏览器（静默失败） */
-async function injectCookies(cookies) {
+/**
+ * 批量注入 Cookie 数组到浏览器（静默失败）
+ * @param {Array} cookies 待注入的 Cookie 数组
+ * @param {string} [storeId] 目标 Cookie 容器；省略则沿用各 Cookie 自带的 storeId
+ */
+async function injectCookies(cookies, storeId) {
     await Promise.all((cookies || []).map(c =>
         chrome.cookies.set({
             url: cookieToUrl(c),
@@ -33,7 +57,7 @@ async function injectCookies(cookies) {
             httpOnly: c.httpOnly,
             sameSite: c.sameSite,
             expirationDate: c.expirationDate,
-            storeId: c.storeId
+            storeId: storeId || c.storeId
         }).catch(() => { })
     ));
 }
@@ -67,7 +91,7 @@ function ensureExpiry(maxExpiry, hasCore) {
     return maxExpiry;
 }
 
-/** Cookie 精简映射（去除 storeId/httpOnly 等，减少存储/传输体积） */
+/** Cookie 精简映射（去除 storeId 等运行时字段，减少存储/传输体积） */
 function slimCookie(c) {
     return {
         name: c.name,
@@ -75,6 +99,7 @@ function slimCookie(c) {
         domain: c.domain,
         path: c.path,
         secure: c.secure,
+        httpOnly: c.httpOnly,
         sameSite: c.sameSite,
         expirationDate: c.expirationDate
     };

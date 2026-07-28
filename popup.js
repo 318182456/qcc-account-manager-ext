@@ -386,56 +386,72 @@ async function editAccountName(accountId) {
 
 // ─── 单账号检测 ───
 
+/**
+ * 检测单个账号
+ *
+ * 非当前账号一律只做本地凭证检查，不再「注入 Cookie → 发请求 → 还原」：
+ * 那套做法会把浏览器全局身份改成别人的，是账号被服务器踢下线的主要原因。
+ * 真实的网络检测交由 background 的隔离保活（隐身容器）完成。
+ */
 async function checkSingleAccount(accountId) {
     const statusEl = document.getElementById(`status-${accountId}`);
     if (statusEl) statusEl.textContent = "检测中...";
 
-    const storage = await chrome.storage.local.get({ accounts: [] });
+    const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
     const targetAcc = storage.accounts.find(a => a.id === accountId);
     if (!targetAcc) return;
 
-    // 备份当前 Cookie
-    const currentCookies = await chrome.cookies.getAll({ domain: QCC_DOMAIN });
+    const isCurrent = targetAcc.id === storage.currentAccountId;
+    let resultStatus;
+    let statusColor;
 
-    try {
-        // 打入目标账号 Cookie
-        await clearAllQccCookies();
-        await injectCookies(targetAcc.cookies);
+    if (isCurrent) {
+        // 当前账号：用它自己的身份发请求，无风险
+        try {
+            const res = await fetch(QCC_PROBE_URL, { credentials: "include" });
+            if (res.redirected && res.url.includes("login")) {
+                resultStatus = "已注销";
+                statusColor = "var(--text-muted)";
+            } else if (res.status === 425) {
+                resultStatus = "受阻 (425限制)";
+                statusColor = "var(--danger)";
+            } else if (res.status === 401 || res.status === 403) {
+                resultStatus = `失效 (${res.status})`;
+                statusColor = "var(--danger)";
+            } else {
+                resultStatus = "正常在线";
+                statusColor = "var(--success)";
+            }
+        } catch (e) {
+            console.warn("当前账号检测抛错:", e);
+            resultStatus = "测不准";
+            statusColor = "var(--text-muted)";
+        }
+    } else {
+        // 其他账号：仅凭本地 Cookie 有效期判断
+        const { maxExpiry, hasCore } = calcMaxExpiry(targetAcc.cookies);
+        const nowSec = Date.now() / 1000;
 
-        // 探针请求
-        const res = await fetch(QCC_PROBE_URL);
-        let resultStatus = "正常";
-        let statusColor = "green";
-
-        if (res.redirected && res.url.includes("login")) {
-            resultStatus = "已注销";
-            statusColor = "var(--text-secondary)";
-        } else if (res.status === 425) {
-            resultStatus = "受阻 (425限制)";
-            statusColor = "var(--danger-color)";
-        } else if (res.status === 401 || res.status === 403) {
-            resultStatus = `失效 (${res.status})`;
-            statusColor = "var(--danger-color)";
+        if (!hasCore) {
+            resultStatus = "无凭证";
+            statusColor = "var(--danger)";
+        } else if (maxExpiry > 0 && maxExpiry <= nowSec) {
+            resultStatus = "已过期";
+            statusColor = "var(--danger)";
         } else {
-            resultStatus = "正常在线";
+            const hoursLeft = maxExpiry > 0 ? (maxExpiry - nowSec) / 3600 : Infinity;
+            resultStatus = hoursLeft < 24
+                ? `凭证有效 (剩 ${hoursLeft.toFixed(0)}h)`
+                : "凭证有效";
+            statusColor = hoursLeft < 24 ? "var(--warning, orange)" : "var(--success)";
         }
+    }
 
-        targetAcc.lastStatus = resultStatus;
-        await chrome.storage.local.set({ accounts: storage.accounts });
-        if (statusEl) {
-            statusEl.textContent = resultStatus;
-            statusEl.style.color = statusColor;
-        }
-    } catch (e) {
-        console.warn("单体测试抛出错误:", e);
-        if (statusEl) {
-            statusEl.textContent = "测不准";
-            statusEl.style.color = "var(--text-secondary)";
-        }
-    } finally {
-        // 恢复原先 Cookie
-        await clearAllQccCookies();
-        await injectCookies(currentCookies);
+    targetAcc.lastStatus = resultStatus;
+    await chrome.storage.local.set({ accounts: storage.accounts });
+    if (statusEl) {
+        statusEl.textContent = resultStatus;
+        statusEl.style.color = statusColor;
     }
 }
 
@@ -450,7 +466,8 @@ checkAllBtn.addEventListener("click", async () => {
     checkAllBtn.style.cursor = "wait";
 
     try {
-        for (const acc of storage.accounts) {
+        // 全部为本地检查（当前账号最多一个请求），可直接串行
+        for (const acc of storage.accounts.filter(a => !a.deleted)) {
             await checkSingleAccount(acc.id);
         }
     } finally {
@@ -496,15 +513,15 @@ async function checkAccountStatus() {
         const res = await fetch(QCC_PROBE_URL);
         if (res.redirected && res.url.includes("login")) {
             accountStatusText.textContent = "已注销";
-            accountStatusText.style.color = "var(--text-secondary)";
+            accountStatusText.style.color = "var(--text-muted)";
             return;
         } else if (res.status === 425) {
             accountStatusText.textContent = "访问限制";
-            accountStatusText.style.color = "var(--danger-color)";
+            accountStatusText.style.color = "var(--danger)";
             return;
         } else if (res.status === 401 || res.status === 403) {
             accountStatusText.textContent = `受阻或掉线 (${res.status})`;
-            accountStatusText.style.color = "var(--danger-color)";
+            accountStatusText.style.color = "var(--danger)";
             return;
         }
     } catch (e) {
@@ -513,7 +530,7 @@ async function checkAccountStatus() {
 
     const tab = await getActiveQccTab();
     if (!tab) {
-        accountStatusText.innerHTML = `<a href="#" id="jumpToQcc" style="color:var(--text-secondary); text-decoration:underline;">请打开页面体验 DOM 检测 (点击前往)</a>`;
+        accountStatusText.innerHTML = `<a href="#" id="jumpToQcc" style="color:var(--text-muted); text-decoration:underline;">请打开页面体验 DOM 检测 (点击前往)</a>`;
         document.getElementById("jumpToQcc").addEventListener("click", (e) => {
             e.preventDefault();
             chrome.tabs.create({ url: QCC_URL });
@@ -538,9 +555,9 @@ async function checkAccountStatus() {
         if (status === "正常在线") {
             accountStatusText.style.color = "green";
         } else if (status === "已注销") {
-            accountStatusText.style.color = "var(--text-secondary)";
+            accountStatusText.style.color = "var(--text-muted)";
         } else {
-            accountStatusText.style.color = "var(--danger-color)";
+            accountStatusText.style.color = "var(--danger)";
         }
 
         // 关键修复：如果检测到状态和存储中的不一致（如检测到已注销），同步回存储

@@ -12,18 +12,60 @@ function log(...args) { console.log(`[${_ts()}]`, ...args); }
 function logW(...args) { console.warn(`[${_ts()}]`, ...args); }
 function logE(...args) { console.error(`[${_ts()}]`, ...args); }
 
+/**
+ * incognito: "split" 会让 Service Worker 在普通和隐身上下文各跑一份实例。
+ * 保活/同步只应由普通实例执行，否则请求和存储写入会翻倍。
+ */
+const IS_INCOGNITO_CONTEXT = chrome.extension.inIncognitoContext === true;
+
 // ─── Alarm 管理 ───
 
-async function ensureAlarms() {
-    await chrome.alarms.clearAll();
-    chrome.alarms.create(RENEWAL_ALARM_NAME, { periodInMinutes: RENEWAL_INTERVAL_MIN });
-    chrome.alarms.create(SYNC_ALARM_NAME, { periodInMinutes: SYNC_INTERVAL_MIN });
-    chrome.alarms.create(ALL_RENEWAL_ALARM_NAME, { periodInMinutes: ALL_RENEWAL_INTERVAL_MIN });
-    log("[保活] alarm 已就绪:", (await chrome.alarms.getAll()).map(a => `${a.name}(${a.periodInMinutes}m)`).join(", "));
+/**
+ * Alarm 排期表：每个 alarm 用「基础周期 ± 抖动」的一次性排期，
+ * 触发后重新排期。固定 periodInMinutes 会形成可识别的机器人心跳节奏。
+ */
+const ALARM_SCHEDULE = {
+    [RENEWAL_ALARM_NAME]: { base: RENEWAL_BASE_MIN, jit: RENEWAL_JITTER_MIN },
+    [SYNC_ALARM_NAME]: { base: SYNC_BASE_MIN, jit: SYNC_JITTER_MIN },
+    [ALL_RENEWAL_ALARM_NAME]: { base: ALL_RENEWAL_BASE_MIN, jit: ALL_RENEWAL_JITTER_MIN }
+};
+
+/** 按抖动后的延迟重新排期单个 alarm */
+function scheduleAlarm(name) {
+    const cfg = ALARM_SCHEDULE[name];
+    if (!cfg) return;
+    const delay = jitter(cfg.base, cfg.jit);
+    chrome.alarms.create(name, { delayInMinutes: delay });
+    log(`[排期] ${name} → ${delay.toFixed(1)} 分钟后`);
 }
 
-chrome.runtime.onInstalled.addListener(() => ensureAlarms());
-chrome.runtime.onStartup.addListener(() => ensureAlarms());
+/**
+ * 补齐缺失的 alarm
+ *
+ * 用的是一次性 alarm（为了抖动），触发后即失效。若 Service Worker 在
+ * 重新排期前被终止，该 alarm 会永久丢失，保活将静默停止。因此每次
+ * Worker 唤醒都检查一遍，缺哪个补哪个。
+ * @param {boolean} [reset] 为 true 时清空后全部重排
+ */
+async function ensureAlarms(reset = false) {
+    if (IS_INCOGNITO_CONTEXT) {
+        log("[排期] 隐身上下文实例，不注册 alarm");
+        return;
+    }
+
+    if (reset) await chrome.alarms.clearAll();
+
+    const existing = new Set((await chrome.alarms.getAll()).map(a => a.name));
+    for (const name of Object.keys(ALARM_SCHEDULE)) {
+        if (!existing.has(name)) scheduleAlarm(name);
+    }
+}
+
+chrome.runtime.onInstalled.addListener(() => ensureAlarms(true));
+chrome.runtime.onStartup.addListener(() => ensureAlarms(true));
+
+// Worker 每次冷启动都自愈一次，防止一次性 alarm 丢失后保活永久停摆
+ensureAlarms();
 
 // ─── 消息监听 ───
 
@@ -41,6 +83,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
+    // alarm 事件会广播到两个实例；隐身实例直接忽略，避免任务重复执行
+    if (IS_INCOGNITO_CONTEXT) return;
+
+    // 一次性 alarm 触发即失效，先重新排期再执行任务
+    scheduleAlarm(alarm.name);
+
     if (alarm.name === RENEWAL_ALARM_NAME) {
         log("[保活] 定时保活触发...");
         performRenewalFetch();
@@ -69,88 +117,67 @@ function buildBrowseHeaders() {
 // ─── 探针请求 ───
 
 /**
- * 三重判定 Session 是否存活
- * 返回 { isAlive, isLoggedOut, responseStatus, detail }
+ * 判定 Session 是否存活
+ *
+ * 只请求首页（一个请求），并从响应体推断登录态；仅在首页请求彻底失败时
+ * 才回落到 Cookie 检测。原实现串行打首页 + 业务 API 两个请求，业务接口的
+ * 风控权重远高于首页，且请求数翻倍。
+ *
+ * @param {string} [storeId] Cookie 容器 ID，仅用于兜底检测的读取范围
+ * @returns {{ isAlive, isLoggedOut, responseStatus, detail }}
  */
-async function probeSession() {
-    // 第一步：GET 首页
-    const homepageRes = await fetch(QCC_INDEX_URL, {
-        method: "GET",
-        headers: buildBrowseHeaders(),
-        credentials: "include"
-    });
+async function probeSession(storeId) {
+    let status = 0;
+    let body = "";
 
-    if (homepageRes.redirected && homepageRes.url.includes("login")) {
-        log("[探针] 首页重定向到 login");
-        return { isAlive: false, isLoggedOut: true, responseStatus: homepageRes.status, detail: "首页重定向login" };
-    }
-
-    // 第二步：API 探针
-    let probeStatus = 0;
-    let probeBody = "";
     try {
-        const probeRes = await fetch(QCC_PROBE_URL, {
+        const res = await fetch(QCC_PROBE_URL, {
             method: "GET",
-            headers: {
-                ...buildBrowseHeaders(),
-                "Accept": "application/json, text/plain, */*",
-                "X-Requested-With": "XMLHttpRequest"
-            },
+            headers: buildBrowseHeaders(),
             credentials: "include"
         });
-        probeStatus = probeRes.status;
+        status = res.status;
 
-        if (probeRes.redirected && probeRes.url.includes("login")) {
-            log("[探针] API 重定向到 login");
-            return { isAlive: false, isLoggedOut: true, responseStatus: probeStatus, detail: "API重定向login" };
+        if (res.redirected && res.url.includes("login")) {
+            log("[探针] 首页重定向到 login");
+            return { isAlive: false, isLoggedOut: true, responseStatus: status, detail: "重定向login" };
         }
 
-        if (probeStatus === 401 || probeStatus === 403 || probeStatus === 425) {
-            log(`[探针] API 返回异常状态码: ${probeStatus}`);
-            return { isAlive: false, isLoggedOut: false, responseStatus: probeStatus, detail: `HTTP ${probeStatus}` };
+        if (status === 401 || status === 403 || status === 425) {
+            log(`[探针] 异常状态码: ${status}`);
+            return { isAlive: false, isLoggedOut: false, responseStatus: status, detail: `HTTP ${status}` };
         }
 
-        probeBody = await probeRes.text();
+        body = await res.text();
 
-        try {
-            const json = JSON.parse(probeBody);
-            const s = json.status || json.Status;
-            const msg = json.message || json.Message || "";
-
-            if (s === 409 || /登录|login|未授权|expired/i.test(msg)) {
-                log(`[探针] API 判定已注销 (status=${s}, message=${msg})`);
-                return { isAlive: false, isLoggedOut: true, responseStatus: probeStatus, detail: `API status=${s}` };
-            }
-            log(`[探针] API 判定存活 (status=${s}, message=${msg})`);
-        } catch (_) {
-            if (probeBody.includes("login") && (probeBody.includes("password") || probeBody.includes("密码"))) {
-                log("[探针] API 返回了 HTML 登录页面");
-                return { isAlive: false, isLoggedOut: true, responseStatus: probeStatus, detail: "返回HTML登录页" };
-            }
+        // 首页返回登录表单 → 已注销
+        if (/name=["']?password|输入密码|请登录/i.test(body)) {
+            log("[探针] 首页返回登录表单");
+            return { isAlive: false, isLoggedOut: true, responseStatus: status, detail: "返回登录页" };
         }
     } catch (e) {
-        logW("[探针] API 请求网络异常:", e.message);
+        logW("[探针] 首页请求网络异常:", e.message);
     }
 
-    // 第三步：Cookie 兜底检测
-    const cookies = await chrome.cookies.getAll({ domain: QCC_DOMAIN });
-    const hasQCCSESSID = cookies.some(c => c.name === "QCCSESSID" && c.value);
-    const hasToken = cookies.some(c => c.name === "Token" && c.value);
+    // Cookie 兜底：网络不可用或响应无法判定时，至少确认凭证是否还在
+    const query = { domain: QCC_DOMAIN };
+    if (storeId) query.storeId = storeId;
+    const cookies = await chrome.cookies.getAll(query);
+    const hasCore = CORE_COOKIE_NAMES.some(n => cookies.some(c => c.name === n && c.value));
 
-    if (!hasQCCSESSID && !hasToken) {
-        log("[探针] Cookie 兜底检测：QCCSESSID 和 Token 均不存在，判定已注销");
-        return { isAlive: false, isLoggedOut: true, responseStatus: probeStatus, detail: "无核心Cookie" };
+    if (!hasCore) {
+        log("[探针] Cookie 兜底：核心 Cookie 均不存在，判定已注销");
+        return { isAlive: false, isLoggedOut: true, responseStatus: status, detail: "无核心Cookie" };
     }
 
-    log(`[探针] 判定存活 (HTTP=${probeStatus}, SESSID=${hasQCCSESSID}, Token=${hasToken}, body=${probeBody.substring(0, 120)})`);
-    return { isAlive: true, isLoggedOut: false, responseStatus: probeStatus, detail: "OK" };
+    log(`[探针] 判定存活 (HTTP=${status}, core=${hasCore})`);
+    return { isAlive: true, isLoggedOut: false, responseStatus: status, detail: "OK" };
 }
 
 // ─── 当前账号保活 ───
 
 async function performRenewalFetch() {
     try {
-        const { isAlive, isLoggedOut, responseStatus } = await probeSession();
         const storage = await chrome.storage.local.get({ accounts: [], currentAccountId: null });
 
         if (!storage.currentAccountId) {
@@ -162,6 +189,21 @@ async function performRenewalFetch() {
         if (currIdx === -1) {
             log("[保活] 找不到当前账号记录，跳过");
             return;
+        }
+
+        // 用户正在浏览企查查时，页面自身的请求已在续期，无需再发探针
+        const openTabs = await chrome.tabs.query({ url: QCC_MATCH_PATTERN });
+        const pageActive = openTabs.length > 0;
+
+        let isAlive, isLoggedOut, responseStatus;
+        if (pageActive) {
+            const cookies = await chrome.cookies.getAll({ domain: QCC_DOMAIN });
+            isAlive = CORE_COOKIE_NAMES.some(n => cookies.some(c => c.name === n && c.value));
+            isLoggedOut = !isAlive;
+            responseStatus = 0;
+            log(`[保活] 企查查页面活跃 → 免请求模式，凭证${isAlive ? "存在" : "缺失"}`);
+        } else {
+            ({ isAlive, isLoggedOut, responseStatus } = await probeSession());
         }
 
         if (isAlive) {
@@ -352,12 +394,147 @@ async function performAutoSync() {
     }
 }
 
+// ─── 隐身容器隔离 ───
+
+/**
+ * 定位隐身 Cookie 容器的 storeId
+ *
+ * 隐身容器只在存在隐身窗口时才出现，因此需要先开一个隐身窗口。
+ * @returns {Promise<{storeId: string, windowId: number}|null>} 不可用时返回 null
+ */
+async function acquireIncognitoStore() {
+    if (!chrome.extension.isAllowedIncognitoAccess) return null;
+    const allowed = await chrome.extension.isAllowedIncognitoAccess();
+    if (!allowed) {
+        logW("[隔离] 扩展未获得隐身模式访问权限，无法隔离保活");
+        return null;
+    }
+
+    // 用户已有隐身窗口时不新建，避免污染其隐身会话
+    const wins = await chrome.windows.getAll({});
+    if (wins.some(w => w.incognito)) {
+        logW("[隔离] 检测到用户已开启隐身窗口，本轮跳过隔离保活");
+        return null;
+    }
+
+    // about:blank 起窗，避免额外产生一次企查查请求
+    let win;
+    try {
+        win = await chrome.windows.create({
+            url: "about:blank",
+            incognito: true,
+            state: "minimized"
+        });
+    } catch (e) {
+        logW("[隔离] 创建隐身窗口失败:", e.message);
+        return null;
+    }
+
+    const stores = await chrome.cookies.getAllCookieStores();
+    const incogStore = stores.find(s => s.id !== COOKIE_STORE_NORMAL);
+
+    if (!incogStore) {
+        logW("[隔离] 未能定位隐身 Cookie 容器");
+        await chrome.windows.remove(win.id).catch(() => { });
+        return null;
+    }
+
+    log(`[隔离] 隐身容器就绪: storeId=${incogStore.id}, windowId=${win.id}`);
+    return { storeId: incogStore.id, windowId: win.id };
+}
+
+/** 在指定窗口打开标签页、等其加载完成，然后关闭 */
+async function visitInWindow(windowId, url) {
+    const tab = await chrome.tabs.create({ url, windowId, active: false });
+
+    await new Promise(resolve => {
+        let done = false;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            chrome.tabs.onRemoved.removeListener(onRemoved);
+            resolve();
+        };
+
+        const timer = setTimeout(finish, TAB_LOAD_TIMEOUT_MS);
+        const onUpdated = (tabId, info) => {
+            if (tabId === tab.id && info.status === "complete") finish();
+        };
+        // 标签页被意外关闭时也要退出等待，否则会一直挂到超时
+        const onRemoved = (tabId) => { if (tabId === tab.id) finish(); };
+
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        chrome.tabs.onRemoved.addListener(onRemoved);
+    });
+
+    // 页面加载完成后仍有异步 XHR 会刷新 Cookie，静置一小段时间再读取
+    await sleep(TAB_SETTLE_MS);
+    await chrome.tabs.remove(tab.id).catch(() => { });
+}
+
+/**
+ * 在隐身容器内为单个账号续期，全程不触碰普通容器
+ * @returns {Promise<{isAlive, isLoggedOut, responseStatus, cookies}>}
+ */
+async function renewInIsolation(acc, ctx) {
+    await clearAllQccCookies(ctx.storeId);
+    await injectCookies(acc.cookies, ctx.storeId);
+
+    // 由隐身标签页自己带着隔离 Cookie 发真实请求（fetch 无法指定容器）
+    await visitInWindow(ctx.windowId, QCC_INDEX_URL);
+
+    const cookies = await chrome.cookies.getAll({ domain: QCC_DOMAIN, storeId: ctx.storeId });
+    const hasCore = CORE_COOKIE_NAMES.some(n => cookies.some(c => c.name === n && c.value));
+
+    return {
+        isAlive: hasCore,
+        isLoggedOut: !hasCore,
+        responseStatus: 0,
+        cookies
+    };
+}
+
 // ─── 全员静默保活 ───
 
-async function performAllAccountsRenewal() {
-    const tabs = await chrome.tabs.query({ url: QCC_MATCH_PATTERN });
-    const hasQccTabOpen = tabs && tabs.length > 0;
+/** 仅本地检查过期时间并提醒，不发任何请求 */
+async function notifyExpiringAccounts(targets, currentAccountId) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const warning = [];
 
+    for (const acc of targets) {
+        if (acc.id === currentAccountId) continue;
+        const { maxExpiry } = calcMaxExpiry(acc.cookies);
+        const hoursLeft = maxExpiry > 0 ? (maxExpiry - nowSec) / 3600 : -1;
+
+        if (hoursLeft >= 0 && hoursLeft <= 24) {
+            warning.push(acc.name);
+            logW(`[保活检查] ${acc.name} → 剩余 ${hoursLeft.toFixed(1)}h，即将过期！`);
+        }
+    }
+
+    if (warning.length > 0) {
+        chrome.notifications.create(`qcc-expiring-${Date.now()}`, {
+            type: "basic",
+            iconUrl: NOTIFICATION_ICON_URL,
+            title: "账号即将过期",
+            message: `${warning.join("、")} 即将过期，请手动切换登录以续期。`,
+            priority: 2
+        });
+    }
+}
+
+/**
+ * 全员静默保活
+ *
+ * 在隐身 Cookie 容器内逐个续期，普通容器（用户当前身份）全程不被触碰。
+ * 原实现在全局容器里反复清空/注入 Cookie，导致：
+ *   1. 循环期间用户打开企查查会带上别人的 Cookie；
+ *   2. 同一浏览器指纹短时间内切换多个身份，触发服务器风控把账号全部踢下线；
+ *   3. 还原时用的是循环开始前的旧快照，可能覆盖掉已轮换的有效 Cookie。
+ */
+async function performAllAccountsRenewal() {
     // 先同步最新快照
     try {
         await performAutoSync();
@@ -370,95 +547,75 @@ async function performAllAccountsRenewal() {
     const allTargets = storage.accounts.filter(a => !a.deleted);
     if (allTargets.length === 0) return;
 
-    if (hasQccTabOpen) {
-        // 安全模式：仅本地检查过期时间
-        log("[全员保活] 企查查页面已打开 → 安全模式：仅本地检查过期时间，不替换Cookie");
+    // 只续期临近过期的账号：有效期还长的账号无需打扰服务器
+    const nowSec = Math.floor(Date.now() / 1000);
+    const targets = allTargets.filter(acc => {
+        if (acc.id === storage.currentAccountId) return false; // 当前账号由 performRenewalFetch 负责
+        const { maxExpiry } = calcMaxExpiry(acc.cookies);
+        if (maxExpiry <= 0) return false;
+        const hoursLeft = (maxExpiry - nowSec) / 3600;
+        return hoursLeft > 0 && hoursLeft < RENEWAL_THRESHOLD_HOURS;
+    });
 
-        const nowSec = Math.floor(Date.now() / 1000);
-        const warningAccounts = [];
-
-        for (const acc of allTargets) {
-            if (acc.id === storage.currentAccountId) continue;
-            const { maxExpiry } = calcMaxExpiry(acc.cookies);
-            const hoursLeft = maxExpiry > 0 ? (maxExpiry - nowSec) / 3600 : -1;
-
-            if (hoursLeft < 0 || hoursLeft > 24) {
-                log(`[全员保活·安全] ${acc.name} → ${hoursLeft < 0 ? "已过期" : `剩余 ${Math.floor(hoursLeft)}h，暂安全`}`);
-            } else {
-                warningAccounts.push(acc.name);
-                logW(`[全员保活·安全] ${acc.name} → 剩余 ${hoursLeft.toFixed(1)}h，即将过期！`);
-            }
-        }
-
-        if (warningAccounts.length > 0) {
-            chrome.notifications.create(`qcc-safe-warn-${Date.now()}`, {
-                type: "basic",
-                iconUrl: NOTIFICATION_ICON_URL,
-                title: "账号即将过期（安全模式提醒）",
-                message: `${warningAccounts.join("、")} 即将过期，请关闭企查查页面后等待自动续期，或手动切换保活。`,
-                priority: 2
-            });
-        }
-
-        log("[全员保活·安全] 本地检查完成，网络续期将在企查查页面关闭后自动进行。");
+    if (targets.length === 0) {
+        log(`[全员保活] 无账号进入 ${RENEWAL_THRESHOLD_HOURS}h 续期窗口，跳过网络续期。`);
+        await notifyExpiringAccounts(allTargets, storage.currentAccountId);
         return;
     }
 
-    // 完整模式：Cookie 替换 + 网络续期
-    log("[全员保活] 无企查查活动页面，执行完整网络续期...");
-
-    const currentCookies = await chrome.cookies.getAll({ domain: QCC_DOMAIN });
-
-    for (let i = 0; i < allTargets.length; i++) {
-        const acc = allTargets[i];
-        log(`[全员保活] (${i + 1}/${allTargets.length}) 正在保活: ${acc.name}`);
-
-        await clearAllQccCookies();
-        await injectCookies(acc.cookies);
-
-        try {
-            const { isAlive, isLoggedOut, responseStatus } = await probeSession();
-            const freshStorage = await chrome.storage.local.get({ accounts: [] });
-            const freshDbAcc = freshStorage.accounts.find(a => a.id === acc.id);
-
-            if (freshDbAcc && !freshDbAcc.deleted) {
-                if (isAlive) {
-                    freshDbAcc.lastStatus = "正常在线 (后台续期)";
-                    const newCookies = await chrome.cookies.getAll({ domain: QCC_DOMAIN });
-                    const { maxExpiry: rawExpiry, hasCore } = calcMaxExpiry(newCookies);
-                    const maxExpiry = ensureExpiry(rawExpiry, hasCore);
-
-                    freshDbAcc.cookies = newCookies.map(slimCookie);
-                    freshDbAcc.expiry = maxExpiry;
-                    freshDbAcc.savedAt = Date.now();
-
-                    // 如果是当前使用的账号，更新备份
-                    if (acc.id === storage.currentAccountId) {
-                        currentCookies.length = 0;
-                        currentCookies.push(...newCookies);
-                    }
-                    log(`[全员保活] ${acc.name} → 续期成功，Expiry: ${new Date(maxExpiry * 1000).toLocaleString()}`);
-                } else {
-                    freshDbAcc.lastStatus = isLoggedOut ? "已注销" : `失效 (${responseStatus})`;
-                    freshDbAcc.expiry = Math.floor(Date.now() / 1000) - 1;
-                    logW(`[全员保活] ${acc.name} → 已失效 (${isLoggedOut ? '已注销' : responseStatus})`);
-                }
-                await chrome.storage.local.set({ accounts: freshStorage.accounts });
-            }
-        } catch (e) {
-            logW(`[全员保活] ${acc.name} 保活异常:`, e);
-        }
-
-        // 每个账号间隔
-        if (i < allTargets.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, RENEWAL_INTERVAL_SEC));
-        }
+    const ctx = await acquireIncognitoStore();
+    if (!ctx) {
+        // 降级：不做 Cookie 轮转，只提醒。宁可让账号自然过期，也不冒掉线风险。
+        logW("[全员保活] 隐身容器不可用 → 降级为仅提醒模式（不轮转 Cookie）");
+        await notifyExpiringAccounts(allTargets, storage.currentAccountId);
+        return;
     }
 
-    // 还原 Cookie
-    await clearAllQccCookies();
-    await injectCookies(currentCookies);
-    log("[全员保活] 全员静默保活完成，已还原原先全局现场。");
+    log(`[全员保活] 隔离模式启动，待续期 ${targets.length} 个账号`);
+
+    try {
+        for (let i = 0; i < targets.length; i++) {
+            const acc = targets[i];
+            log(`[全员保活] (${i + 1}/${targets.length}) 正在保活: ${acc.name}`);
+
+            try {
+                const { isAlive, isLoggedOut, responseStatus, cookies } = await renewInIsolation(acc, ctx);
+
+                // 重新读取存储：保活耗时较长，期间可能已有其他改动
+                const fresh = await chrome.storage.local.get({ accounts: [] });
+                const dbAcc = fresh.accounts.find(a => a.id === acc.id);
+                if (!dbAcc || dbAcc.deleted) continue;
+
+                if (isAlive) {
+                    const { maxExpiry: rawExpiry, hasCore } = calcMaxExpiry(cookies);
+                    dbAcc.cookies = cookies.map(slimCookie);
+                    dbAcc.expiry = ensureExpiry(rawExpiry, hasCore);
+                    dbAcc.savedAt = Date.now();
+                    dbAcc.lastStatus = "正常在线 (隔离续期)";
+                    log(`[全员保活] ${acc.name} → 续期成功，Expiry: ${new Date(dbAcc.expiry * 1000).toLocaleString()}`);
+                } else {
+                    dbAcc.lastStatus = isLoggedOut ? "已注销" : `失效 (${responseStatus})`;
+                    dbAcc.expiry = Math.floor(Date.now() / 1000) - 1;
+                    logW(`[全员保活] ${acc.name} → 已失效`);
+                }
+                await chrome.storage.local.set({ accounts: fresh.accounts });
+            } catch (e) {
+                logW(`[全员保活] ${acc.name} 保活异常:`, e);
+            }
+
+            // 账号之间留足带抖动的间隔，避免密集切换身份
+            if (i < targets.length - 1) {
+                const gap = jitter(RENEWAL_GAP_BASE_MS, RENEWAL_GAP_JITTER_MS);
+                log(`[全员保活] 等待 ${(gap / 1000).toFixed(1)}s 后继续...`);
+                await sleep(gap);
+            }
+        }
+    } finally {
+        // 清空隐身容器痕迹并关窗；普通容器从未被修改，无需还原
+        await clearAllQccCookies(ctx.storeId).catch(() => { });
+        await chrome.windows.remove(ctx.windowId).catch(() => { });
+        log("[全员保活] 隔离环境已清理，用户当前身份全程未受影响。");
+    }
 
     performAutoSync().catch(e => logE("[全员保活] 保活后同步出错:", e));
 }
