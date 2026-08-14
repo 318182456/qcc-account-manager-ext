@@ -94,7 +94,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         performRenewalFetch();
     } else if (alarm.name === SYNC_ALARM_NAME) {
         log("[同步] 定时同步触发...");
-        performAutoSync();
+        performAutoSync().catch(e => logE("[同步] 定时同步失败:", e));
     } else if (alarm.name === ALL_RENEWAL_ALARM_NAME) {
         log("[保活] 全员保活触发...");
         performAllAccountsRenewal();
@@ -276,22 +276,35 @@ async function getOrCreateDeviceInfo() {
     return { deviceId, deviceName };
 }
 
-/** 带超时的 fetch 封装 */
+/** 带超时的 fetch 封装（WebDAV 专用，禁用浏览器凭据接管） */
 async function abortFetch(url, method, headers, body = null) {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), WEBDAV_TIMEOUT_MS);
     try {
-        const r = await fetch(url, { method, headers, body, signal: ctrl.signal });
+        const r = await webdavFetch(url, { method, headers, body, signal: ctrl.signal });
         clearTimeout(t);
         return r;
     } catch (e) { clearTimeout(t); throw e; }
 }
 
+/**
+ * 校验 WebDAV 响应；遇到认证/路径类错误时抛出可读异常。
+ * GET 允许 404（首次同步时 manifest.json / devices.json 尚不存在）。
+ */
+function assertWebdavOk(res, { allow404 = false } = {}) {
+    if (res.ok) return res;
+    if (allow404 && res.status === 404) return res;
+    const msg = describeWebdavError(res.status);
+    throw new Error(msg || `WebDAV 请求失败 (${res.status})`);
+}
+
 async function performAutoSync() {
-    const storage = await chrome.storage.local.get({ webdav: null, accounts: [], autoSync: true, lastUploadAt: {} });
-    if (!storage.autoSync) return false;
-    const config = storage.webdav;
+    // 配置在 sync（跨设备），账号数据在 local（体积超 sync 限额）
+    const { webdav: config, autoSync } = await getSyncedConfig();
+    if (!autoSync) return false;
     if (!config || !config.url) return false;
+
+    const storage = await chrome.storage.local.get({ accounts: [], lastUploadAt: {} });
 
     const baseUrl = normalizeBaseUrl(config.url);
     const headers = buildWebdavHeaders(config);
@@ -299,6 +312,7 @@ async function performAutoSync() {
     try {
         // 1. 读远端 manifest
         const mRes = await abortFetch(baseUrl + "manifest.json", "GET", headers);
+        assertWebdavOk(mRes, { allow404: true });
         let remoteManifest = [];
         if (mRes.ok) {
             const txt = await mRes.text();
@@ -329,7 +343,7 @@ async function performAutoSync() {
                 };
 
                 const h2 = { ...headers, "Content-Type": "application/json" };
-                await abortFetch(baseUrl + acc.id + ".json", "PUT", h2, JSON.stringify(slim));
+                assertWebdavOk(await abortFetch(baseUrl + acc.id + ".json", "PUT", h2, JSON.stringify(slim)));
                 newLastUpload[acc.id] = localTime;
                 const entry = { id: acc.id, name: acc.name, savedAt: localTime, deleted: acc.deleted || false };
                 if (manifestIdx.has(acc.id)) { newManifest[manifestIdx.get(acc.id)] = entry; }
@@ -346,6 +360,7 @@ async function performAutoSync() {
 
             if (remoteTime > localTime) {
                 const r = await abortFetch(baseUrl + rEntry.id + ".json", "GET", headers);
+                assertWebdavOk(r, { allow404: true });
                 if (r.ok) {
                     const remoteAcc = JSON.parse(await r.text());
                     localMap.set(rEntry.id, remoteAcc);
@@ -357,7 +372,7 @@ async function performAutoSync() {
         if (changed) {
             const toUpload = newManifest.filter(m => !m.deleted || (m.savedAt || 0) > Date.now() - TOMBSTONE_TTL_MS);
             const mh = { ...headers, "Content-Type": "application/json" };
-            await abortFetch(baseUrl + "manifest.json", "PUT", mh, JSON.stringify(toUpload));
+            assertWebdavOk(await abortFetch(baseUrl + "manifest.json", "PUT", mh, JSON.stringify(toUpload)));
             await chrome.storage.local.set({ accounts: Array.from(localMap.values()), lastUploadAt: newLastUpload });
             log("[同步] 目录模式双向同步完成，有数据更新。");
         }
@@ -366,6 +381,7 @@ async function performAutoSync() {
         try {
             const { deviceId, deviceName } = await getOrCreateDeviceInfo();
             const devRes = await abortFetch(baseUrl + "devices.json", "GET", headers);
+            assertWebdavOk(devRes, { allow404: true });
             let deviceList = [];
             if (devRes.ok) {
                 const txt = await devRes.text();
@@ -390,7 +406,9 @@ async function performAutoSync() {
         return changed;
     } catch (e) {
         logE("[同步] 后台自动同步失败:", e);
-        return false;
+        // 向上抛出，让手动同步能把认证/路径类错误原文展示给用户；
+        // 定时同步的调用方均已挂 .catch，不受影响。
+        throw e;
     }
 }
 

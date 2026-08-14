@@ -7,7 +7,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     const saveStatus = document.getElementById("saveStatus");
 
     // 取出现有配置
-    const storage = await chrome.storage.local.get({ webdav: null, autoSync: true });
+    const storage = await getSyncedConfig();
     if (storage.webdav) {
         webdavUrl.value = storage.webdav.url || "";
         webdavUser.value = storage.webdav.user || "";
@@ -25,7 +25,7 @@ document.addEventListener("DOMContentLoaded", async () => {
             return;
         }
 
-        await chrome.storage.local.set({
+        await setSyncedConfig({
             webdav: { url, user, pass },
             autoSync: autoSync.checked
         });

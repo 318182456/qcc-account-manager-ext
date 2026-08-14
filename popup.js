@@ -632,7 +632,7 @@ async function renderDevices() {
     const deviceNameInput = document.getElementById("deviceNameInput");
     if (deviceName) deviceNameInput.value = deviceName;
 
-    const { webdav } = await chrome.storage.local.get({ webdav: null });
+    const { webdav } = await getSyncedConfig();
     if (!webdav || !webdav.url) {
         deviceListEl.innerHTML = `<div class="empty-state">请先在⚙️配置页填写 WebDAV 参数。</div>`;
         countBadge.textContent = "0";
@@ -643,9 +643,14 @@ async function renderDevices() {
     const headers = buildWebdavHeaders(webdav);
 
     try {
-        const res = await fetch(baseUrl + "devices.json", { headers });
+        const res = await webdavFetch(baseUrl + "devices.json", { headers });
         if (!res.ok) {
-            deviceListEl.innerHTML = `<div class="empty-state">暂无设备记录（首次同步后自动生成）。</div>`;
+            const err = describeWebdavError(res.status);
+            // 404 是首次同步的正常状态，其余（401/403/5xx）需明确告知用户
+            const hint = (res.status === 404 || !err)
+                ? "暂无设备记录（首次同步后自动生成）。"
+                : err;
+            deviceListEl.innerHTML = `<div class="empty-state">${hint}</div>`;
             countBadge.textContent = "0";
             return;
         }
@@ -697,13 +702,17 @@ document.getElementById("saveDeviceNameBtn").addEventListener("click", async () 
         const { deviceId } = await chrome.storage.local.get({ deviceId: null });
         await chrome.storage.local.set({ deviceName: newName });
 
-        const { webdav } = await chrome.storage.local.get({ webdav: null });
+        const { webdav } = await getSyncedConfig();
         if (webdav && webdav.url && deviceId) {
             const baseUrl = normalizeBaseUrl(webdav.url);
             const headers = buildWebdavHeaders(webdav);
-            const res = await fetch(baseUrl + "devices.json", { headers });
+            const res = await webdavFetch(baseUrl + "devices.json", { headers });
             let devices = [];
             if (res.ok) devices = JSON.parse(await res.text());
+            else {
+                const err = describeWebdavError(res.status);
+                if (err && res.status !== 404) throw new Error(err);
+            }
             const extVersion = chrome.runtime.getManifest().version;
             const existing = devices.find(d => d.id === deviceId);
             if (existing) {
@@ -713,11 +722,14 @@ document.getElementById("saveDeviceNameBtn").addEventListener("click", async () 
             } else {
                 devices.push({ id: deviceId, name: newName, lastSyncAt: Date.now(), version: extVersion });
             }
-            await fetch(baseUrl + "devices.json", {
+            const putRes = await webdavFetch(baseUrl + "devices.json", {
                 method: "PUT",
                 headers: { ...headers, "Content-Type": "application/json" },
                 body: JSON.stringify(devices)
             });
+            if (!putRes.ok) {
+                throw new Error(describeWebdavError(putRes.status) || `写入失败 (${putRes.status})`);
+            }
         }
         await renderDevices();
     } catch (e) {
@@ -733,13 +745,13 @@ document.getElementById("saveDeviceNameBtn").addEventListener("click", async () 
 async function checkAndHotReload() {
     const STORE_KEY = "ext_version";
     try {
-        const { webdav } = await chrome.storage.local.get({ webdav: null });
+        const { webdav } = await getSyncedConfig();
         if (!webdav?.url) return;
 
         const baseUrl = normalizeBaseUrl(webdav.url);
         const headers = buildWebdavHeaders(webdav);
 
-        const res = await fetch(baseUrl + "version.json", { headers, cache: "no-store" });
+        const res = await webdavFetch(baseUrl + "version.json", { headers, cache: "no-store" });
         if (!res.ok) return;
 
         const { version } = await res.json();
